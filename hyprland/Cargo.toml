@@ -17,7 +17,14 @@ axum = "0.8"
 tokio-tungstenite = "0.30"
 
 # overlay window: layer-shell surface + WebView, see overlay/
-gtk4 = "0.11"
+#
+# gtk4's `v4_10` feature must be enabled explicitly (Cargo feature
+# unification applies it crate-wide): webkit6 0.6.1's generated bindings
+# reference `gtk::Accessible`, which gtk4-rs 0.11.5 gates behind that
+# feature, but webkit6's own Cargo.toml doesn't request it — enabling it
+# here is what makes webkit6 compile at all. System libgtk4 on this
+# machine is 4.22, well above the minimum this asks for.
+gtk4 = { version = "0.11", features = ["v4_10"] }
 gtk4-layer-shell = "0.8"
 webkit6 = "0.6"
 
