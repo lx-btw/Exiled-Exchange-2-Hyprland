@@ -16,7 +16,7 @@
 //! Stage 4 (see PLAN.md).
 
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -87,14 +87,14 @@ fn set_visible_on_main_thread(visible: bool) {
 }
 
 /// A parsed `ShortcutAction` (`ipc/types.ts`) this fork can actually act on.
-/// Action types not listed here (`ocr-text`, `stash-search`, `paste-in-chat`,
-/// `test-only`) are still Stage 5+ and are dropped during parsing — see
-/// `parse_bindings`.
+/// Action types not listed here (`ocr-text`, `paste-in-chat`, `test-only`)
+/// are still Stage 5+ and are dropped during parsing — see `parse_bindings`.
 #[derive(Debug, Clone)]
 enum Action {
     CopyItem { target: String, focus_overlay: bool },
     ToggleOverlay,
     TriggerEvent { target: String },
+    StashSearch { text: String },
 }
 
 #[derive(Debug, Clone)]
@@ -149,6 +149,17 @@ fn parse_bindings(shortcuts: &[Value]) -> Vec<Binding> {
                         target: target.to_string(),
                     }
                 }
+                "stash-search" => {
+                    let Some(text) = action_val.get("text").and_then(Value::as_str) else {
+                        eprintln!(
+                            "ee2-hyprland: shortcut \"{shortcut_str}\": stash-search action missing \"text\", skipping"
+                        );
+                        return None;
+                    };
+                    Action::StashSearch {
+                        text: text.to_string(),
+                    }
+                }
                 other => {
                     eprintln!(
                         "ee2-hyprland: shortcut \"{shortcut_str}\": action \"{other}\" not yet supported, skipping"
@@ -187,6 +198,20 @@ pub struct Overlay {
     game_active: bool,
     overlay_interactive: bool,
     interactive_since: Instant,
+    /// A weak handle back to the `Arc<TokioMutex<Overlay>>` this instance
+    /// lives inside — set once in `main.rs` right after that `Arc` is
+    /// constructed (`Overlay::new` can't fill it in itself, chicken-and-egg:
+    /// the `Arc` doesn't exist yet). `handle_ws_event` is the one caller:
+    /// it runs with the lock already held (`server.rs`'s
+    /// `overlay.lock().await.handle_ws_event(...)`), so a WS-triggered
+    /// `stash-search` (an "everyday" trigger path — it's a button click
+    /// *inside* an already-open widget, not a hotkey) needs this to spawn
+    /// `run_stash_search` as its own task rather than running the whole
+    /// clipboard-write-plus-key-injection sequence inline and blocking
+    /// every other WS message and focus-change update for its duration —
+    /// the same class of problem `run_copy_item`'s split-lock design
+    /// avoids, see its docs.
+    self_ref: Weak<TokioMutex<Overlay>>,
 }
 
 impl Overlay {
@@ -215,8 +240,15 @@ impl Overlay {
             game_active: false,
             overlay_interactive: false,
             interactive_since: Instant::now(),
+            self_ref: Weak::new(),
         };
         Ok((overlay, hotkey_bindings))
+    }
+
+    /// See `self_ref`'s docs — must be called once, right after `Overlay` is
+    /// wrapped in its `Arc<TokioMutex<_>>`, before any WS traffic can arrive.
+    pub fn attach_self_ref(&mut self, self_ref: Weak<TokioMutex<Overlay>>) {
+        self.self_ref = self_ref;
     }
 
     pub async fn config_contents(&self) -> Option<String> {
@@ -313,6 +345,9 @@ impl Overlay {
                     "name": "MAIN->CLIENT::widget-action",
                     "payload": {"target": target},
                 }));
+            }
+            Action::StashSearch { text } => {
+                Self::run_stash_search(overlay, &text).await;
             }
         }
     }
@@ -417,6 +452,62 @@ impl Overlay {
         guard.set_interactive(true);
     }
 
+    /// Ports `text-box.ts::stashSearch()`: write `text` to the clipboard the
+    /// game will actually read from, make sure the game rather than the
+    /// overlay has keyboard focus, then inject `Ctrl+F`/`Ctrl+V`/`Enter`.
+    ///
+    /// The focus step matters more here than it does for `run_copy_item`:
+    /// stash-search is normally triggered by clicking a button *inside* an
+    /// already-open, interactive widget, so the layer-shell surface is very
+    /// likely holding `KeyboardMode::EXCLUSIVE` at the moment this runs —
+    /// without switching to passthrough first, the injected keys would
+    /// land in the WebView instead of the game (upstream's own equivalent,
+    /// `assertGameActive()`, does the same "give focus back to the game"
+    /// step via `OverlayController.focusTarget()` before injecting).
+    /// `set_interactive(false)`'s passthrough switch marshals onto the GTK
+    /// main thread asynchronously (see `set_passthrough_on_main_thread`),
+    /// so a short delay follows before injecting — not otherwise guarded
+    /// against here.
+    async fn run_stash_search(overlay: &Arc<TokioMutex<Overlay>>, text: &str) {
+        let copy_item = {
+            let mut guard = overlay.lock().await;
+            guard.set_interactive(false);
+            guard.copy_item.clone()
+        };
+
+        // Give the passthrough switch above time to actually land (GTK
+        // main-thread marshal, not synchronous with the call above) before
+        // keys get injected — same order-of-magnitude as INJECT_STAGGER
+        // and upstream's own RESTORE_AFTER, not independently tuned.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let clients = match compositor::clients().await {
+            Ok(clients) => clients,
+            Err(err) => {
+                eprintln!("ee2-hyprland: stash-search: failed to query clients: {err}");
+                return;
+            }
+        };
+        let Some(game) = compositor::find_game(&clients) else {
+            eprintln!(
+                "ee2-hyprland: stash-search: game window ({}) not found",
+                compositor::game_class()
+            );
+            return;
+        };
+        let xwayland = game.xwayland;
+
+        if let Err(err) = clipboard::write_text(text, xwayland).await {
+            eprintln!("ee2-hyprland: stash-search: failed to write clipboard: {err}");
+            return;
+        }
+
+        let mut state = copy_item.lock().await;
+        if let Err(err) = state.keyboard.stash_search().await {
+            eprintln!("ee2-hyprland: stash-search: injection failed: {err}");
+        }
+    }
+
     /// The big dispatcher for everything arriving over WS `/events`. Ports
     /// `host.mjs`'s `ws.on("message", ...)` switch — same event set, same
     /// scope (`used-recently`/`write-data`/`re-parse-log`/`render-state`/
@@ -467,8 +558,31 @@ impl Overlay {
                 self.game_config.read(game_config_path).await;
             }
             "CLIENT->MAIN::user-action" => {
-                if payload.get("action").and_then(Value::as_str) == Some("quit") {
-                    std::process::exit(0);
+                match payload.get("action").and_then(Value::as_str) {
+                    Some("quit") => std::process::exit(0),
+                    Some("stash-search") => {
+                        let Some(text) = payload.get("text").and_then(Value::as_str) else {
+                            eprintln!(
+                                "ee2-hyprland: stash-search user-action missing \"text\", ignoring"
+                            );
+                            return;
+                        };
+                        let text = text.to_string();
+                        // See `self_ref`'s docs: spawned so this doesn't
+                        // hold the lock `server.rs` is calling us under for
+                        // the whole clipboard-write-plus-injection sequence.
+                        match self.self_ref.upgrade() {
+                            Some(overlay) => {
+                                tokio::spawn(async move {
+                                    Self::run_stash_search(&overlay, &text).await;
+                                });
+                            }
+                            None => eprintln!(
+                                "ee2-hyprland: stash-search: self_ref not attached yet, ignoring"
+                            ),
+                        }
+                    }
+                    _ => {}
                 }
             }
             "OVERLAY->MAIN::focus-game" => {

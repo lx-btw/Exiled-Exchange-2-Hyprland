@@ -112,4 +112,45 @@ impl VirtualKeyboard {
 
         Ok(())
     }
+
+    /// A plain key tap: down, stagger, up, stagger — same `INJECT_STAGGER`
+    /// timing as `copy_item`, reused here rather than re-tuned since it's
+    /// the same virtual device and the same class of "give the game time to
+    /// see each edge" concern.
+    async fn tap(&mut self, code: KeyCode) -> io::Result<()> {
+        self.key(code, true)?;
+        tokio::time::sleep(INJECT_STAGGER).await;
+        self.key(code, false)?;
+        tokio::time::sleep(INJECT_STAGGER).await;
+        Ok(())
+    }
+
+    /// `Ctrl+<code>`, released unconditionally afterward (even on a
+    /// mid-sequence write error) for the same reason `copy_item` does:
+    /// a `uinput` write failure must never leave Ctrl reported "held" on
+    /// the virtual device.
+    async fn tap_with_ctrl(&mut self, code: KeyCode) -> io::Result<()> {
+        let ctrl = Modifier::Ctrl.left_keycode();
+        let result = async {
+            self.key(ctrl, true)?;
+            tokio::time::sleep(INJECT_STAGGER).await;
+            self.tap(code).await
+        }
+        .await;
+        let _ = self.key(ctrl, false);
+        result
+    }
+
+    /// PoE2's stash-search combo, ported from upstream's
+    /// `text-box.ts::stashSearch()`: `Ctrl+F` opens the stash search box,
+    /// `Ctrl+V` pastes whatever `clipboard::write_text` already placed on
+    /// the clipboard, `Enter` confirms. Caller's job to have already made
+    /// sure the game (not the overlay) has keyboard focus — see
+    /// `state.rs::run_stash_search`.
+    pub async fn stash_search(&mut self) -> io::Result<()> {
+        self.tap_with_ctrl(KeyCode::KEY_F).await?;
+        self.tap_with_ctrl(KeyCode::KEY_V).await?;
+        self.tap(KeyCode::KEY_ENTER).await?;
+        Ok(())
+    }
 }

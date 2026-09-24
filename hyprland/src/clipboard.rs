@@ -372,6 +372,46 @@ async fn read_x11_selection() -> io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Writes `text` to the clipboard the game will actually read from —
+/// `wl-copy` for a native/Wayland-Proton client, `xsel -b -i` (matching
+/// `read_x11_selection`'s own fallback) for Xwayland, gated on the same
+/// `xwayland` flag every other clipboard function here takes. Stash-search
+/// (`state.rs::run_stash_search`) is the only caller: a one-shot,
+/// user-triggered write, not a per-keystroke hot path, so this reaches for
+/// a subprocess rather than a `zwlr_data_control_source_v1` — the same
+/// scope-reduction call already made for the X11 *read* fallback above
+/// (holding a data-control source open long enough for the game to
+/// actually paste, and answering repeated `Send` events until then, is a
+/// real chunk of protocol machinery this doesn't justify).
+pub async fn write_text(text: &str, xwayland: bool) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut command = if xwayland {
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
+        let mut command = tokio::process::Command::new("xsel");
+        command.args(["-b", "-i"]).env("DISPLAY", display);
+        command
+    } else {
+        tokio::process::Command::new("wl-copy")
+    };
+
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin was piped above");
+    stdin.write_all(text.as_bytes()).await?;
+    drop(stdin); // EOF, so the reading end (xsel) can return
+
+    let status = child.wait().await?;
+    if !status.success() {
+        let program = if xwayland { "xsel" } else { "wl-copy" };
+        return Err(io::Error::other(format!(
+            "{program} exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
 /// Waits (up to `timeout`) for a clipboard read that looks like item text —
 /// call `drain_stale` immediately before triggering the copy that this is
 /// meant to observe, so a leftover buffered event can't be mistaken for it.

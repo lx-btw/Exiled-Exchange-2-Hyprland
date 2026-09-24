@@ -47,6 +47,10 @@ fn main() -> gtk4::glib::ExitCode {
                 }
             };
             let overlay = Arc::new(Mutex::new(overlay));
+            overlay
+                .lock()
+                .await
+                .attach_self_ref(Arc::downgrade(&overlay));
 
             let app_state = server::AppState {
                 overlay: overlay.clone(),
