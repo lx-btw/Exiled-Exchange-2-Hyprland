@@ -113,9 +113,21 @@ async fn sync_mirror_to_physical(hypr_name: &str) {
     match compositor::keyboards().await {
         Ok(list) => match list.iter().find(|d| d.name == hypr_name) {
             Some(dev) => {
-                if let Err(err) =
-                    compositor::switchxkblayout(MIRROR_KEYBOARD_NAME, dev.active_layout_index)
-                        .await
+                // `switchxkblayout` addresses devices by Hyprland's own
+                // mangled name, same as `j/devices` reports them — a plain
+                // `MIRROR_KEYBOARD_NAME` (with a literal space) never
+                // matches anything, confirmed live (2026-09-24, H2A
+                // verification): the raw constant was used here
+                // unmangled, so this call silently targeted a
+                // nonexistent device name every single time (Hyprland's
+                // socket still replies without an IO error, so nothing
+                // surfaced it) — caught only via the *other* direction's
+                // symmetric lookup logging "mirror device not found".
+                if let Err(err) = compositor::switchxkblayout(
+                    &hypr_device_name(MIRROR_KEYBOARD_NAME),
+                    dev.active_layout_index,
+                )
+                .await
                 {
                     eprintln!(
                         "ee2-hyprland: capture: failed to sync mirror layout to \"{hypr_name}\": {err}"
@@ -136,8 +148,9 @@ async fn sync_mirror_to_physical(hypr_name: &str) {
 /// so the physical device gets back whatever layout the user toggled to
 /// while typing through the mirror.
 async fn sync_physical_to_mirror(hypr_name: &str) {
+    let mirror_hypr_name = hypr_device_name(MIRROR_KEYBOARD_NAME);
     match compositor::keyboards().await {
-        Ok(list) => match list.iter().find(|d| d.name == MIRROR_KEYBOARD_NAME) {
+        Ok(list) => match list.iter().find(|d| d.name == mirror_hypr_name) {
             Some(dev) => {
                 if let Err(err) =
                     compositor::switchxkblayout(hypr_name, dev.active_layout_index).await
@@ -298,7 +311,7 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
-    use super::hypr_device_name;
+    use super::{hypr_device_name, MIRROR_KEYBOARD_NAME};
 
     #[test]
     fn matches_live_hyprland_device_names() {
@@ -313,5 +326,23 @@ mod tests {
             "asustek-rog-gladius-iii-wireless-consumer-control"
         );
         assert_eq!(hypr_device_name("Power Button"), "power-button");
+    }
+
+    /// Regression test for a real bug found in the first live H2A
+    /// verification (2026-09-24): `sync_mirror_to_physical`/
+    /// `sync_physical_to_mirror` used to compare against the raw
+    /// `MIRROR_KEYBOARD_NAME` constant (a literal space in it) instead of
+    /// its mangled form — so the mirror device was never found in
+    /// `j/devices`, and `switchxkblayout` was never once sent a name that
+    /// resolved to anything, on every single one of 15 real grab/ungrab
+    /// cycles in that session's log. Both call sites now go through
+    /// `hypr_device_name` — this pins the exact mangled string they
+    /// resolve to.
+    #[test]
+    fn mirror_name_is_mangled_before_use() {
+        assert_eq!(
+            hypr_device_name(MIRROR_KEYBOARD_NAME),
+            "ee2-hyprland-input-passthrough"
+        );
     }
 }
