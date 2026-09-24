@@ -5,8 +5,9 @@
 //! `onActiveWindow()`), adapted to a single-process design: `host.mjs` sent
 //! `tellOverlay()` commands over a unix socket to a *separate* overlay
 //! process; here the overlay lives in the same process, so this just calls
-//! `overlay::window::set_passthrough()` directly (marshaled onto the GTK
-//! main thread — see `register_window`/`set_interactive`).
+//! `overlay::window::set_input_region()`/`set_keyboard_mode()` directly
+//! (marshaled onto the GTK main thread — see `register_window`/
+//! `set_interactive`).
 //!
 //! Owns the whole price-check flow end to end (`run_copy_item`): find the
 //! game window, inject `Ctrl+Alt+C`, read the clipboard back, broadcast
@@ -15,7 +16,7 @@
 //!
 //! Stage 4 (see PLAN.md).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -55,16 +56,58 @@ const COPY_ITEM_TIMEOUT: Duration = Duration::from_millis(2500);
 
 thread_local! {
     static WINDOW: RefCell<Option<gtk4::ApplicationWindow>> = const { RefCell::new(None) };
+    // Both GTK-main-thread-only, mirroring state that's authoritative
+    // elsewhere (`Overlay::overlay_interactive`'s `bool`, and the WebView's
+    // own DOM focus) — cached here purely so `apply_keyboard_mode` (H2B,
+    // below) can be called synchronously from a WebKit signal handler
+    // (`webview.rs`, fires on this same thread) without needing the async
+    // `TokioMutex<Overlay>` lock, which a synchronous GTK/WebKit C callback
+    // can't await into.
+    static INTERACTIVE: Cell<bool> = const { Cell::new(false) };
+    static INPUT_FOCUSED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Must be called once, on the GTK main thread, right after the overlay
 /// window is created — registers it so `set_interactive` (callable from any
-/// thread) has something to marshal `overlay::window::set_passthrough`
-/// calls onto. Without this, there is no safe way to touch the window from
-/// the tokio tasks that receive hotkey/WS/compositor events, since GTK
-/// objects aren't `Send`.
+/// thread) has something to marshal `overlay::window` calls onto. Without
+/// this, there is no safe way to touch the window from the tokio tasks that
+/// receive hotkey/WS/compositor events, since GTK objects aren't `Send`.
 pub fn register_window(window: gtk4::ApplicationWindow) {
     WINDOW.with(|w| *w.borrow_mut() = Some(window));
+}
+
+/// Applies `KeyboardMode::Exclusive` iff the overlay is currently
+/// mouse-interactive *and* an input element inside the WebView currently
+/// has DOM focus — `None` otherwise. H2B (PLAN.md): before this, keyboard
+/// mode was tied 1:1 to interactive/passthrough (`set_passthrough_on_main_thread`
+/// set `Exclusive` the instant the overlay became interactive at all), so
+/// `Shift+Space` opening the overlay stole every keystroke from the game
+/// immediately, not just while actually typing into a field — this is what
+/// makes WASD keep working while the overlay is open and mouse-clickable.
+/// Called from two places, both already on the GTK main thread:
+/// `set_passthrough_on_main_thread` (when `Overlay.overlay_interactive`
+/// changes) and `set_input_focused` (when DOM focus changes, `webview.rs`).
+fn apply_keyboard_mode() {
+    WINDOW.with(|w| {
+        if let Some(window) = w.borrow().as_ref() {
+            let exclusive = INTERACTIVE.with(|i| i.get()) && INPUT_FOCUSED.with(|f| f.get());
+            overlay::window::set_keyboard_mode(window, exclusive);
+        }
+    });
+}
+
+/// Called from `webview.rs`'s WebKit script-message handler (fires on the
+/// GTK main thread already, no marshaling needed — see that call site) with
+/// whatever the injected focus-bridge script last observed. Deliberately
+/// not gated on `INTERACTIVE` here — `apply_keyboard_mode` already factors
+/// that in, and caching the raw DOM-focus signal unconditionally means a
+/// field that was focused before the overlay went passthrough (then became
+/// interactive again without a fresh click) correctly regains keyboard
+/// focus too, matching how a real desktop app's focus state persists across
+/// a window being hidden and shown again.
+pub fn set_input_focused(focused: bool) {
+    INPUT_FOCUSED.with(|f| f.set(focused));
+    apply_keyboard_mode();
 }
 
 fn set_passthrough_on_main_thread(passthrough: bool) {
@@ -90,9 +133,11 @@ fn set_passthrough_on_main_thread(passthrough: bool) {
                 if !passthrough {
                     overlay::window::set_visible(window, true);
                 }
-                overlay::window::set_passthrough(window, passthrough);
+                overlay::window::set_input_region(window, passthrough);
             }
         });
+        INTERACTIVE.with(|i| i.set(!passthrough));
+        apply_keyboard_mode();
     });
 }
 
@@ -254,6 +299,15 @@ pub struct Overlay {
     /// real behavioral gap from upstream, not a hypothetical.
     hotkeys_active: watch::Sender<bool>,
     overlay_interactive: bool,
+    /// Mirrors `overlay_interactive` out to `hotkeys.rs::watch()`, same
+    /// `watch` shape and reason as `hotkeys_active` — added 2026-09-24, H2B,
+    /// for evdev-level `Esc` handling: upstream's `OverlayWindow.ts`
+    /// hardcodes `Escape` (in its `before-input-event` handler, entirely
+    /// separate from `Shortcuts.ts`'s user-configurable bindings) to always
+    /// close an interactive overlay, so `hotkeys.rs`'s central loop needs to
+    /// know "is the overlay currently interactive" independent of whether
+    /// this specific keypress happens to match a configured hotkey.
+    overlay_interactive_tx: watch::Sender<bool>,
     interactive_since: Instant,
     /// Ports upstream's `OverlayWindow.wasUsedRecently` (default `true`),
     /// updated from `CLIENT->MAIN::used-recently`'s `isOverlay` field —
@@ -293,11 +347,12 @@ impl Overlay {
     /// them and that only makes sense as `Overlay` methods.
     pub fn new(
         events_tx: broadcast::Sender<Value>,
-    ) -> std::io::Result<(Self, Bindings, watch::Receiver<bool>)> {
+    ) -> std::io::Result<(Self, Bindings, watch::Receiver<bool>, watch::Receiver<bool>)> {
         let keyboard = VirtualKeyboard::new()?;
         let clipboard_rx = clipboard::spawn()?;
         let hotkey_bindings: Bindings = Arc::new(StdMutex::new(Vec::new()));
         let (hotkeys_active_tx, hotkeys_active_rx) = watch::channel(false);
+        let (overlay_interactive_tx, overlay_interactive_rx) = watch::channel(false);
 
         let overlay = Self {
             config_store: ConfigStore::new(),
@@ -313,12 +368,18 @@ impl Overlay {
             game_active: false,
             hotkeys_active: hotkeys_active_tx,
             overlay_interactive: false,
+            overlay_interactive_tx,
             interactive_since: Instant::now(),
             used_recently: true,
             area_tracker: None,
             self_ref: Weak::new(),
         };
-        Ok((overlay, hotkey_bindings, hotkeys_active_rx))
+        Ok((
+            overlay,
+            hotkey_bindings,
+            hotkeys_active_rx,
+            overlay_interactive_rx,
+        ))
     }
 
     /// See `self_ref`'s docs — must be called once, right after `Overlay` is
@@ -409,11 +470,27 @@ impl Overlay {
             self.interactive_since = Instant::now();
         }
         set_passthrough_on_main_thread(!interactive);
+        let _ = self.overlay_interactive_tx.send(interactive);
         // A layer surface isn't a window and never appears in `activewindow`
         // events, so this is the *only* way the renderer learns the overlay
         // itself became active — without it, it holds `overlay: false`
         // forever and never renders anything.
         self.send_focus_change(false);
+    }
+
+    /// Ports upstream's `OverlayWindow.ts::handleExtraCommands`'s `Escape`
+    /// case (via `assertGameActive`) — called from `hotkeys.rs`'s evdev-level
+    /// `Esc` handling. `Esc` isn't a user-configurable shortcut; upstream
+    /// hardcodes it the same way, entirely separate from `Shortcuts.ts`'s
+    /// bindings. **Unlike `toggle_overlay`, this only ever deactivates** —
+    /// verified against upstream's actual source (not the original task's
+    /// assumption that Escape would behave differently while a text field
+    /// has focus): `before-input-event` intercepts Escape before the
+    /// renderer's own DOM ever sees it, unconditionally, so upstream closes
+    /// the overlay even mid-typing rather than just blurring the field.
+    pub(crate) fn close_overlay(&mut self) {
+        self.stop_area_tracker();
+        self.set_interactive(false);
     }
 
     /// Dispatches a hotkey firing (the index `hotkeys::watch` sent) to the

@@ -194,11 +194,20 @@ fn open_keyboards() -> Vec<Device> {
 /// while it is too. Modifier/held-key bookkeeping still runs regardless of
 /// this flag — only match-and-fire and the grab itself are gated — so state
 /// stays accurate for whenever the game becomes active again.
+///
+/// `overlay_interactive` (`state.rs`'s `Overlay.overlay_interactive_tx`) and
+/// `close_overlay_tx` are H2B's `Esc` handling (see the `KEY_ESC` case
+/// below) — `Esc` isn't in `bindings` at all (it isn't a user-configurable
+/// shortcut upstream either; `OverlayWindow.ts` hardcodes it separately
+/// from `Shortcuts.ts`), so it gets its own watch channel to read and its
+/// own action channel to fire, rather than a synthetic `bindings` entry.
 pub async fn watch(
     bindings: Bindings,
     mut game_active: watch::Receiver<bool>,
+    overlay_interactive: watch::Receiver<bool>,
     modifiers: Arc<ModifierState>,
     tx: mpsc::UnboundedSender<usize>,
+    close_overlay_tx: mpsc::UnboundedSender<()>,
 ) {
     let devices = open_keyboards();
     if devices.is_empty() {
@@ -366,6 +375,25 @@ pub async fn watch(
                                         return;
                                     }
                                 }
+                            }
+
+                            // H2B: `Esc` always closes an interactive
+                            // overlay — a bare press only (no modifiers),
+                            // matching upstream's `handleExtraCommands`
+                            // switch, which compares against the literal
+                            // string `"Escape"` (a held modifier produces
+                            // `"Shift + Escape"` etc., which doesn't match
+                            // that case and falls through untouched).
+                            if code == KeyCode::KEY_ESC
+                                && !ctrl
+                                && !shift
+                                && !alt
+                                && *overlay_interactive.borrow()
+                            {
+                                if grabbed {
+                                    consumed = true;
+                                }
+                                let _ = close_overlay_tx.send(());
                             }
                         }
 

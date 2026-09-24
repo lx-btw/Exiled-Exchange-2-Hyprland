@@ -50,13 +50,14 @@ fn main() -> gtk4::glib::ExitCode {
         rt.block_on(async {
             let (events_tx, _events_rx) = broadcast::channel(32);
 
-            let (overlay, hotkey_bindings, hotkeys_active) = match state::Overlay::new(events_tx.clone()) {
-                Ok(result) => result,
-                Err(err) => {
-                    eprintln!("ee2-hyprland: failed to initialize overlay state: {err}");
-                    return;
-                }
-            };
+            let (overlay, hotkey_bindings, hotkeys_active, overlay_interactive) =
+                match state::Overlay::new(events_tx.clone()) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        eprintln!("ee2-hyprland: failed to initialize overlay state: {err}");
+                        return;
+                    }
+                };
             let overlay = Arc::new(Mutex::new(overlay));
             overlay
                 .lock()
@@ -101,11 +102,19 @@ fn main() -> gtk4::glib::ExitCode {
             // `VirtualKeyboard`) strictly before this line.
             let modifiers = input::hotkeys::ModifierState::new();
             let (hotkey_tx, mut hotkey_rx) = mpsc::unbounded_channel();
+            // `close_overlay_tx`: H2B's evdev-level `Esc` handling
+            // (`hotkeys.rs`) — a built-in action, not a `bindings` entry, so
+            // it gets its own channel rather than an index into
+            // `hotkey_bindings` (see `hotkeys.rs`'s own docs on why `Esc`
+            // isn't just another configurable hotkey).
+            let (close_overlay_tx, mut close_overlay_rx) = mpsc::unbounded_channel();
             tokio::spawn(input::hotkeys::watch(
                 hotkey_bindings,
                 hotkeys_active,
+                overlay_interactive,
                 modifiers.clone(),
                 hotkey_tx,
+                close_overlay_tx,
             ));
             {
                 let overlay = overlay.clone();
@@ -114,6 +123,14 @@ fn main() -> gtk4::glib::ExitCode {
                         eprintln!("ee2-hyprland: dispatching hotkey index {index}");
                         state::Overlay::on_hotkey_fired(&overlay, index).await;
                         eprintln!("ee2-hyprland: hotkey index {index} dispatch complete");
+                    }
+                });
+            }
+            {
+                let overlay = overlay.clone();
+                tokio::spawn(async move {
+                    while close_overlay_rx.recv().await.is_some() {
+                        overlay.lock().await.close_overlay();
                     }
                 });
             }

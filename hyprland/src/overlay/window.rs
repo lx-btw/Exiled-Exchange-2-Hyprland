@@ -13,6 +13,16 @@
 //!   states, never pass `None`, mirroring the caution the prior prototype's
 //!   (non-nullable) Python/cairo bindings required, even though this Rust
 //!   binding's signature technically allows it.
+//! - **Input region and keyboard mode are two independent knobs, not one**
+//!   (split 2026-09-24, H2B — see `state.rs`'s `apply_keyboard_mode`). The
+//!   input region still just follows interactive/passthrough, same as
+//!   always; keyboard mode additionally depends on whether an input element
+//!   *inside* the WebView currently has focus (`webview.rs`'s
+//!   focusin/focusout bridge), so the overlay can be mouse-interactive
+//!   (full input region) while the game still receives keyboard input by
+//!   default — only actually typing into a field inside the overlay steals
+//!   the keyboard. `set_keyboard_mode` here still only ever chooses between
+//!   `None` and `Exclusive`, never `OnDemand`, same invariant as always.
 //!
 //! Stage 1 (see PLAN.md). Design rationale: HYPRLAND-NOTES.md §6.
 //! Fallback if WebKit6 mis-renders the upstream renderer: this module (and
@@ -81,17 +91,20 @@ pub fn build(app: &gtk4::Application, webview: &WebView) -> gtk4::ApplicationWin
     window.set_child(Some(webview));
 
     // The surface doesn't exist until realize — apply the initial
-    // passthrough input region then, not now.
-    window.connect_realize(|window| set_passthrough(window, true));
+    // passthrough input region and (keyboard-)None mode then, not now.
+    window.connect_realize(|window| {
+        set_input_region(window, true);
+        set_keyboard_mode(window, false);
+    });
 
     window
 }
 
-/// Toggles the surface's input region between empty (mouse/keyboard pass
-/// through to the game underneath) and full-window (overlay is
-/// interactive). Also flips keyboard mode between `None` and `Exclusive` —
-/// never `OnDemand`, see module docs.
-pub fn set_passthrough(window: &gtk4::ApplicationWindow, passthrough: bool) {
+/// Toggles the surface's input region between empty (mouse passes through
+/// to the game underneath) and full-window (overlay is mouse-interactive).
+/// Split from keyboard mode (`set_keyboard_mode`, below) — see module docs'
+/// H2B entry for why they're no longer one call.
+pub fn set_input_region(window: &gtk4::ApplicationWindow, passthrough: bool) {
     let Some(surface) = window.surface() else {
         return;
     };
@@ -110,7 +123,7 @@ pub fn set_passthrough(window: &gtk4::ApplicationWindow, passthrough: bool) {
                 // state would otherwise desync from reality with no way to
                 // notice or retry, since nothing here reports failure back.
                 eprintln!(
-                    "ee2-hyprland: set_passthrough(false): no window size and no monitor found — ignoring"
+                    "ee2-hyprland: set_input_region(false): no window size and no monitor found — ignoring"
                 );
                 return;
             }
@@ -118,11 +131,20 @@ pub fn set_passthrough(window: &gtk4::ApplicationWindow, passthrough: bool) {
         Region::create_rectangle(&RectangleInt::new(0, 0, width, height))
     };
     surface.set_input_region(Some(&region));
+}
 
-    window.set_keyboard_mode(if passthrough {
-        KeyboardMode::None
-    } else {
+/// Whether the layer surface currently holds real Wayland keyboard focus
+/// (`Exclusive`) or not (`None`) — **never `OnDemand`**, see module docs.
+/// Driven by `state.rs::apply_keyboard_mode`, combining "is the overlay
+/// mouse-interactive at all" with "does an input element inside the WebView
+/// currently have focus" — unlike `set_input_region`, this can flip while
+/// the overlay stays mouse-interactive the whole time (clicking into, then
+/// out of, a text field).
+pub fn set_keyboard_mode(window: &gtk4::ApplicationWindow, exclusive: bool) {
+    window.set_keyboard_mode(if exclusive {
         KeyboardMode::Exclusive
+    } else {
+        KeyboardMode::None
     });
 }
 

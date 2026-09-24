@@ -11,9 +11,59 @@
 
 use gtk4::gdk;
 use webkit6::prelude::*;
-use webkit6::{HardwareAccelerationPolicy, WebView};
+use webkit6::{
+    HardwareAccelerationPolicy, UserContentInjectedFrames, UserContentManager, UserScript,
+    UserScriptInjectionTime, WebView,
+};
+
+use crate::state;
 
 const ELECTRON_UA_SUBSTRING: &str = "Electron/44.0.0";
+
+/// The `window.webkit.messageHandlers.<name>` this WebView's focus bridge
+/// posts to — see `focus_bridge_script`'s doc comment.
+const FOCUS_MESSAGE_HANDLER: &str = "eeFocus";
+
+/// Injected at document-start into every page this `WebView` ever loads
+/// (there's only ever one, the embedded renderer, but `UserScript`s aren't
+/// per-navigation). Bridges DOM focus onto `KeyboardMode` (H2B, PLAN.md):
+/// `document`-level `focusin`/`focusout` delegation (these bubble, unlike
+/// plain `focus`/`blur`, so one pair of listeners at the root catches every
+/// element the renderer ever mounts, including ones that don't exist yet
+/// when this script runs) posts a plain boolean whenever the focus target
+/// is something that actually wants to receive typed keys — `<input>`,
+/// `<textarea>`, `<select>`, or anything `isContentEditable` (the DOM's own
+/// query for "would a real browser deliver text input here", covering
+/// inherited `contenteditable` correctly without reimplementing that
+/// inheritance rule by hand). This is deliberately generic, not tied to
+/// `HotkeyInput.vue`'s specific `<input>` — the renderer also has ordinary
+/// text fields (stash-search text, settings forms) that need the same
+/// treatment, and a document-level delegation selector covers all of them
+/// without touching renderer source. The renderer is never modified; this
+/// is purely an injected observer, nothing it does can be detected from
+/// page script (no properties added to any DOM node, no wrapped
+/// listeners).
+fn focus_bridge_script() -> String {
+    format!(
+        r#"(function() {{
+            function wantsKeyboard(el) {{
+                if (!el) return false;
+                if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT") return true;
+                return !!el.isContentEditable;
+            }}
+            document.addEventListener("focusin", function(e) {{
+                if (wantsKeyboard(e.target)) {{
+                    window.webkit.messageHandlers.{FOCUS_MESSAGE_HANDLER}.postMessage(true);
+                }}
+            }});
+            document.addEventListener("focusout", function(e) {{
+                if (wantsKeyboard(e.target)) {{
+                    window.webkit.messageHandlers.{FOCUS_MESSAGE_HANDLER}.postMessage(false);
+                }}
+            }});
+        }})();"#
+    )
+}
 
 /// Builds a transparent WebView loading `url`, tagged with the UA substring
 /// the renderer's transport check requires.
@@ -46,8 +96,38 @@ const ELECTRON_UA_SUBSTRING: &str = "Electron/44.0.0";
 /// This is the documented, per-object way to ask for the same thing
 /// `WEBKIT_DISABLE_COMPOSITING_MODE` does process-wide, so it replaces the
 /// `unsafe std::env::set_var` call that used to live in `main.rs`.
+///
+/// **H2B, 2026-09-24: now built with a `UserContentManager`** (the
+/// focus-bridge script above, registering `eeFocus`) — the module docs'
+/// note right above about a `UserStyleSheet` reproducibly breaking
+/// `KeyboardMode::Exclusive` is about a *stylesheet* specifically, not
+/// `UserContentManager` itself, but since both go through the same object
+/// this is exactly the class of change that note warns to be careful
+/// with — H2B's own live verification checklist includes actually typing
+/// into a real input field (which only works at all if `Exclusive` still
+/// delivers keystrokes), so a regression here wouldn't go unnoticed.
 pub fn build(url: &str) -> WebView {
-    let webview = WebView::new();
+    let content_manager = UserContentManager::new();
+    content_manager.add_script(&UserScript::new(
+        &focus_bridge_script(),
+        UserContentInjectedFrames::TopFrame,
+        UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+    content_manager.register_script_message_handler(FOCUS_MESSAGE_HANDLER, None);
+    content_manager.connect_script_message_received(Some(FOCUS_MESSAGE_HANDLER), |_ucm, value| {
+        // Fires on the GTK main thread (WebKit dispatches signals on the
+        // thread running the WebView's own `GMainContext`, which is this
+        // process's one and only main loop) — `state::set_input_focused`
+        // touches GTK-thread-only state directly, no marshaling needed,
+        // same as `window.rs`'s `connect_realize` callback.
+        state::set_input_focused(value.to_boolean());
+    });
+
+    let webview = WebView::builder()
+        .user_content_manager(&content_manager)
+        .build();
 
     let settings = WebViewExt::settings(&webview).expect("WebView always has settings");
     let default_ua = settings.user_agent().unwrap_or_default();
