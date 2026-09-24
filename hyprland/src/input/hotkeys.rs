@@ -48,6 +48,59 @@ use super::keymap::{Modifier, Shortcut};
 /// stays open the whole time; only this list is swapped out.
 pub type Bindings = Arc<Mutex<Vec<(Shortcut, usize)>>>;
 
+fn is_held(held: &HashSet<(RawFd, KeyCode)>, codes: [KeyCode; 2]) -> bool {
+    held.iter().any(|(_, k)| codes.contains(k))
+}
+
+/// Live Ctrl/Shift/Alt held-state, merged across every open keyboard device
+/// the same way `watch()`'s own `held` set is — shared with `area_tracker.rs`
+/// (ports `WidgetAreaTracker.ts`'s `e.ctrlKey`/`e.altKey` on each mouse
+/// event) so the area tracker doesn't need to open and track its own
+/// keyboard devices just to answer "is the price-check hold key currently
+/// down". Updated on every keydown *and* keyup, unconditionally — unlike
+/// hotkey matching itself, this must stay accurate even while the game isn't
+/// focused (upstream's `WidgetAreaTracker` mouse tracking isn't gated on
+/// game focus either, only the `globalShortcut` registrations are).
+pub struct ModifierState {
+    ctrl: AtomicBool,
+    shift: AtomicBool,
+    alt: AtomicBool,
+}
+
+impl ModifierState {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            ctrl: AtomicBool::new(false),
+            shift: AtomicBool::new(false),
+            alt: AtomicBool::new(false),
+        })
+    }
+
+    pub fn ctrl(&self) -> bool {
+        self.ctrl.load(Ordering::Relaxed)
+    }
+    /// Unused for now — `WidgetAreaTracker.ts`'s `holdKey` check only ever
+    /// compares against `Ctrl`/`Alt` (`e.ctrlKey`/`e.altKey`), never Shift.
+    /// Tracked anyway for symmetry with `hotkeys.rs`'s own held-modifier
+    /// bookkeeping, which does use all three.
+    #[allow(dead_code)]
+    pub fn shift(&self) -> bool {
+        self.shift.load(Ordering::Relaxed)
+    }
+    pub fn alt(&self) -> bool {
+        self.alt.load(Ordering::Relaxed)
+    }
+
+    fn update(&self, held: &HashSet<(RawFd, KeyCode)>) {
+        self.ctrl
+            .store(is_held(held, Modifier::Ctrl.keycodes()), Ordering::Relaxed);
+        self.shift
+            .store(is_held(held, Modifier::Shift.keycodes()), Ordering::Relaxed);
+        self.alt
+            .store(is_held(held, Modifier::Alt.keycodes()), Ordering::Relaxed);
+    }
+}
+
 /// Opens every device evdev finds under `/dev/input` that looks like a
 /// keyboard (reports `KEY_A` — filters out mice/joysticks, which also emit
 /// `EV_KEY` for their buttons but never letter keys) — **except our own**
@@ -88,7 +141,12 @@ fn open_keyboards() -> Vec<Device> {
 /// bookkeeping still runs regardless of this flag — only the match-and-fire
 /// step is skipped — so state stays accurate for whenever the game becomes
 /// active again, instead of going stale while it's not.
-pub async fn watch(bindings: Bindings, game_active: Arc<AtomicBool>, tx: mpsc::UnboundedSender<usize>) {
+pub async fn watch(
+    bindings: Bindings,
+    game_active: Arc<AtomicBool>,
+    modifiers: Arc<ModifierState>,
+    tx: mpsc::UnboundedSender<usize>,
+) {
     let devices = open_keyboards();
     if devices.is_empty() {
         eprintln!("ee2-hyprland: no keyboard-like /dev/input device found — hotkeys disabled");
@@ -137,14 +195,12 @@ pub async fn watch(bindings: Bindings, game_active: Arc<AtomicBool>, tx: mpsc::U
     drop(events_tx);
 
     let mut held: HashSet<(RawFd, KeyCode)> = HashSet::new();
-    let is_held = |held: &HashSet<(RawFd, KeyCode)>, codes: [KeyCode; 2]| {
-        held.iter().any(|(_, k)| codes.contains(k))
-    };
 
     while let Some((fd, msg)) = events_rx.recv().await {
         let event = match msg {
             DeviceMsg::Closed => {
                 held.retain(|(held_fd, _)| *held_fd != fd);
+                modifiers.update(&held);
                 continue;
             }
             DeviceMsg::Event(event) => event,
@@ -158,6 +214,7 @@ pub async fn watch(bindings: Bindings, game_active: Arc<AtomicBool>, tx: mpsc::U
             // carries no new information for shortcut matching; ignore it.
             1 => {
                 held.insert((fd, code));
+                modifiers.update(&held);
 
                 if !game_active.load(Ordering::Relaxed) {
                     continue;
@@ -181,6 +238,7 @@ pub async fn watch(bindings: Bindings, game_active: Arc<AtomicBool>, tx: mpsc::U
             }
             0 => {
                 held.remove(&(fd, code));
+                modifiers.update(&held);
             }
             _ => {}
         }

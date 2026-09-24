@@ -138,6 +138,19 @@ pub fn set_visible(window: &gtk4::ApplicationWindow, visible: bool) {
     window.set_visible(visible);
 }
 
+/// The monitor this window's surface actually landed on — since `main.rs`
+/// never calls `set_monitor`, that's whichever output the compositor
+/// assigned the layer surface by default. Falls back to the display's first
+/// monitor if the surface isn't realized yet (mirrors
+/// `window_size_or_monitor_fallback`'s own fallback).
+fn current_monitor(window: &gtk4::ApplicationWindow) -> Option<gdk::Monitor> {
+    let display = gtk4::prelude::RootExt::display(window);
+    window
+        .surface()
+        .and_then(|surface| display.monitor_at_surface(&surface))
+        .or_else(|| display.monitors().item(0)?.downcast::<gdk::Monitor>().ok())
+}
+
 /// The window's own allocated size, or — if layout hasn't run yet (e.g.
 /// this is called immediately after `present()`, before the first
 /// size-allocate cycle completes) — the first monitor's geometry as a
@@ -151,13 +164,27 @@ fn window_size_or_monitor_fallback(window: &gtk4::ApplicationWindow) -> Option<(
         return Some((width, height));
     }
 
-    let display = gtk4::prelude::RootExt::display(window);
-    let monitor = window
-        .surface()
-        .and_then(|surface| display.monitor_at_surface(&surface))
-        .or_else(|| display.monitors().item(0)?.downcast::<gdk::Monitor>().ok())?;
-    let geometry = monitor.geometry();
+    let geometry = current_monitor(window)?.geometry();
     Some((geometry.width(), geometry.height()))
+}
+
+/// The overlay's monitor's origin in Hyprland's global layout coordinates —
+/// e.g. `(0, 155)` for a `DP-1` sitting above a shorter second monitor.
+/// `compositor::cursor_pos()` and `hyprctl monitors`/`clients` all report
+/// positions in this global frame, but WebKit's `window.screenX`/`screenY`
+/// on our layer-shell surface are **always `(0, 0)`** — confirmed live
+/// (2026-09-24, Stage 5 hover-price-check work): Wayland doesn't expose a
+/// client's absolute on-screen position to its own content, by design. So
+/// `PriceCheckWindow.vue`'s `area`/`from` math (built from `window.screenX`
+/// and `window.innerWidth`) operates in *monitor-local* logical pixels, and
+/// `state.rs` has to convert `item-text.position` into that same frame
+/// before sending it (and convert `OVERLAY->MAIN::track-area`'s `from`/`area`
+/// back to the global frame before comparing against live `cursor_pos()`
+/// reads) — this is the one place that conversion needs a monitor origin
+/// from, since nothing else in this fork tracks it.
+pub fn current_monitor_origin(window: &gtk4::ApplicationWindow) -> Option<(i32, i32)> {
+    let geometry = current_monitor(window)?.geometry();
+    Some((geometry.x(), geometry.y()))
 }
 
 /// Finds the monitor whose **origin** matches `(x, y)`. Used once

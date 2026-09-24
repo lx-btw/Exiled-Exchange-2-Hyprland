@@ -12,6 +12,7 @@
 //! automatically on mount, no user action needed), and can change live if
 //! the user edits a hotkey in Settings.
 
+mod area_tracker;
 mod clipboard;
 mod compositor;
 mod config;
@@ -98,8 +99,14 @@ fn main() -> gtk4::glib::ExitCode {
             // documents as an already-happened real bug (Stage 2 review) —
             // keep `Overlay::new()` (or anything else that constructs a
             // `VirtualKeyboard`) strictly before this line.
+            let modifiers = input::hotkeys::ModifierState::new();
             let (hotkey_tx, mut hotkey_rx) = mpsc::unbounded_channel();
-            tokio::spawn(input::hotkeys::watch(hotkey_bindings, hotkeys_active, hotkey_tx));
+            tokio::spawn(input::hotkeys::watch(
+                hotkey_bindings,
+                hotkeys_active,
+                modifiers.clone(),
+                hotkey_tx,
+            ));
             {
                 let overlay = overlay.clone();
                 tokio::spawn(async move {
@@ -110,6 +117,18 @@ fn main() -> gtk4::glib::ExitCode {
                     }
                 });
             }
+
+            // Hover price-check area tracking (`OVERLAY->MAIN::track-area`,
+            // see `area_tracker.rs`) — same "spawn the background loop here,
+            // wire it into `Overlay` right after" shape as the hotkey
+            // listener above.
+            let (tracker_tx, tracker_rx) = mpsc::unbounded_channel();
+            tokio::spawn(area_tracker::watch(
+                Arc::downgrade(&overlay),
+                modifiers,
+                tracker_rx,
+            ));
+            overlay.lock().await.attach_area_tracker(tracker_tx);
 
             // Compositor focus tracking: drives `MAIN->OVERLAY::focus-change`
             // (`game` field) — the renderer's own show/hide logic depends on

@@ -23,12 +23,13 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 
+use crate::area_tracker;
 use crate::clipboard::{self, ClipboardEvent};
 use crate::compositor;
 use crate::config::{ConfigStore, GameConfig};
 use crate::input::hotkeys::Bindings;
 use crate::input::inject::VirtualKeyboard;
-use crate::input::keymap::{self, Shortcut};
+use crate::input::keymap::{self, Modifier, Shortcut};
 use crate::overlay;
 
 /// How long after switching to interactive mode an incoming `focus-game`
@@ -94,6 +95,25 @@ fn set_passthrough_on_main_thread(passthrough: bool) {
             }
         });
     });
+}
+
+/// The overlay's current monitor's origin in Hyprland's global layout
+/// coordinates — see `overlay::window::current_monitor_origin`'s docs for
+/// why `run_copy_item`/`handle_ws_event`'s `track-area` handling need this at
+/// all. `None` only if the window doesn't exist yet or GDK can't resolve any
+/// monitor (vanishingly unlikely — see that function's own fallback).
+async fn overlay_monitor_origin() -> Option<(i32, i32)> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    gtk4::glib::MainContext::default().invoke(move || {
+        WINDOW.with(|w| {
+            let origin = w
+                .borrow()
+                .as_ref()
+                .and_then(overlay::window::current_monitor_origin);
+            let _ = tx.send(origin);
+        });
+    });
+    rx.await.ok().flatten()
 }
 
 fn set_visible_on_main_thread(visible: bool) {
@@ -230,6 +250,19 @@ pub struct Overlay {
     hotkeys_active: Arc<AtomicBool>,
     overlay_interactive: bool,
     interactive_since: Instant,
+    /// Ports upstream's `OverlayWindow.wasUsedRecently` (default `true`),
+    /// updated from `CLIENT->MAIN::used-recently`'s `isOverlay` field —
+    /// `run_copy_item` only auto-focuses the overlay on a `focusOverlay`
+    /// copy (the locked/`Ctrl+Alt+D` hotkey) when this is also true, exactly
+    /// matching `Shortcuts.ts`'s `if (action.focusOverlay &&
+    /// this.overlay.wasUsedRecently)`.
+    used_recently: bool,
+    /// `area_tracker::watch`'s command channel, wired up once from
+    /// `main.rs` via `attach_area_tracker` — `None` only in the brief window
+    /// before that call happens, during which `track-area`/copy-item/
+    /// toggle-overlay silently skip starting or stopping a tracking session
+    /// rather than panicking.
+    area_tracker: Option<area_tracker::Handle>,
     /// A weak handle back to the `Arc<TokioMutex<Overlay>>` this instance
     /// lives inside — set once in `main.rs` right after that `Arc` is
     /// constructed (`Overlay::new` can't fill it in itself, chicken-and-egg:
@@ -274,6 +307,8 @@ impl Overlay {
             hotkeys_active: hotkeys_active.clone(),
             overlay_interactive: false,
             interactive_since: Instant::now(),
+            used_recently: true,
+            area_tracker: None,
             self_ref: Weak::new(),
         };
         Ok((overlay, hotkey_bindings, hotkeys_active))
@@ -285,11 +320,26 @@ impl Overlay {
         self.self_ref = self_ref;
     }
 
+    /// Must be called once from `main.rs`, right after `area_tracker::watch`
+    /// is spawned — see `area_tracker`'s own docs.
+    pub fn attach_area_tracker(&mut self, handle: area_tracker::Handle) {
+        self.area_tracker = Some(handle);
+    }
+
+    fn stop_area_tracker(&self) {
+        if let Some(tx) = &self.area_tracker {
+            let _ = tx.send(area_tracker::Cmd::Stop);
+        }
+    }
+
     pub async fn config_contents(&self) -> Option<String> {
         self.config_store.load().await
     }
 
-    fn broadcast(&self, event: Value) {
+    /// `pub(crate)`, not private — `area_tracker.rs` broadcasts
+    /// `MAIN->OVERLAY::hide-exclusive-widget` directly (ports
+    /// `WidgetAreaTracker.ts`'s `this.server.sendEventTo("broadcast", ...)`).
+    pub(crate) fn broadcast(&self, event: Value) {
         // No receivers (nothing connected to /events yet) is a normal,
         // expected state, not an error worth logging.
         let _ = self.events_tx.send(event);
@@ -336,7 +386,14 @@ impl Overlay {
         self.send_focus_change(false);
     }
 
-    fn set_interactive(&mut self, interactive: bool) {
+    /// `pub(crate)`, not private — `area_tracker.rs` calls this directly,
+    /// the same way it calls `assertOverlayActive`/`assertGameActive` on
+    /// upstream's `OverlayWindow`.
+    pub(crate) fn is_interactive(&self) -> bool {
+        self.overlay_interactive
+    }
+
+    pub(crate) fn set_interactive(&mut self, interactive: bool) {
         if interactive == self.overlay_interactive {
             return;
         }
@@ -391,6 +448,10 @@ impl Overlay {
     /// calls this directly, the same effect as the `toggle-overlay`
     /// hotkey action.
     pub(crate) fn toggle_overlay(&mut self) {
+        // Matches `Shortcuts.ts`'s `toggle-overlay` handler: drop any
+        // in-progress hover tracking before flipping state, same as it calls
+        // `areaTracker.removeListeners()` right before `toggleActiveState()`.
+        self.stop_area_tracker();
         let interactive = self.overlay_interactive;
         self.set_interactive(!interactive);
     }
@@ -466,12 +527,33 @@ impl Overlay {
             return;
         };
         let (x, y) = position.unwrap_or((0, 0));
+        // `compositor::cursor_pos()` is in Hyprland's global layout frame;
+        // the renderer's own position math (`PriceCheckWindow.vue`) works in
+        // monitor-local logical pixels (`window.screenX`/`screenY`, always
+        // `(0, 0)` on Wayland — see `current_monitor_origin`'s docs), so this
+        // has to be converted before it's usable there. Falls back to the
+        // raw global position if the monitor origin can't be resolved (the
+        // pre-existing, less-correct behavior) rather than dropping the
+        // whole price check over it.
+        let (ox, oy) = overlay_monitor_origin().await.unwrap_or_else(|| {
+            eprintln!(
+                "ee2-hyprland: copy-item: no monitor origin resolved, using unconverted position"
+            );
+            (0, 0)
+        });
+        let (x, y) = (x - ox, y - oy);
         eprintln!(
             "ee2-hyprland: copy-item: success, {} chars at ({x},{y}), broadcasting item-text",
             text.len()
         );
 
         let mut guard = overlay.lock().await;
+        // Ports `Shortcuts.ts`'s `this.areaTracker.removeListeners()`, called
+        // right before broadcasting a fresh `item-text` on every successful
+        // copy — any hover tracking left over from a previous price check
+        // must not keep reacting to mouse movement once a new one has
+        // started.
+        guard.stop_area_tracker();
         guard.broadcast(json!({
             "name": "MAIN->CLIENT::item-text",
             "payload": {
@@ -482,13 +564,18 @@ impl Overlay {
             },
         }));
 
-        // There's now something for the overlay to show — same as
-        // `host.mjs`, always switch interactive on a successful copy
-        // regardless of `focusOverlay` (upstream's own Electron path is
-        // pickier about this via `wasUsedRecently`; the prior prototype's
-        // simpler unconditional switch is the proven behavior on this
-        // platform layer specifically).
-        guard.set_interactive(true);
+        // Ports `Shortcuts.ts`'s `if (action.focusOverlay &&
+        // this.overlay.wasUsedRecently) { this.overlay.assertOverlayActive();
+        // }` — only the locked (`focusOverlay: true`, e.g. `Ctrl+Alt+D`)
+        // hotkey jumps straight to interactive. A plain hover copy
+        // (`focusOverlay: false`, e.g. `Ctrl+D`) stays passthrough: the
+        // renderer shows the widget on its own (`render-state`) and
+        // `OVERLAY->MAIN::track-area` (handled below) is what makes hovering
+        // onto it — or holding the price-check modifier — actually grab
+        // input.
+        if focus_overlay && guard.used_recently {
+            guard.set_interactive(true);
+        }
     }
 
     /// Ports `text-box.ts::stashSearch()`: write `text` to the clipboard the
@@ -648,13 +735,64 @@ impl Overlay {
                 eprintln!("ee2-hyprland: render-state shouldShow={should_show}");
                 set_visible_on_main_thread(should_show);
             }
-            "CLIENT->MAIN::used-recently"
-            | "CLIENT->MAIN::write-data"
-            | "CLIENT->MAIN::re-parse-log"
-            | "OVERLAY->MAIN::track-area" => {
-                // Logged, not acted on — same as host.mjs. Stash-search's
-                // hover-based close (`track-area`) and session/OCR logging
-                // (`write-data`) are still Stage 5 territory.
+            "CLIENT->MAIN::used-recently" => {
+                // Ports `OverlayWindow.ts`'s `this.wasUsedRecently =
+                // e.isOverlay` — see `run_copy_item`'s use of this field.
+                self.used_recently = payload
+                    .get("isOverlay")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            }
+            "OVERLAY->MAIN::track-area" => {
+                let Some(hold_key) = payload.get("holdKey").and_then(Value::as_str) else {
+                    eprintln!("ee2-hyprland: track-area missing \"holdKey\", ignoring");
+                    return;
+                };
+                let close_threshold = payload
+                    .get("closeThreshold")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    * payload.get("dpr").and_then(Value::as_f64).unwrap_or(1.0);
+                let (Some(from), Some(area)) = (payload.get("from"), payload.get("area")) else {
+                    eprintln!("ee2-hyprland: track-area missing \"from\"/\"area\", ignoring");
+                    return;
+                };
+                let f = |v: &Value, key: &str| v.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+
+                // `from`/`area` arrive in the renderer's monitor-local frame
+                // (see `overlay_monitor_origin`'s docs) — convert back to
+                // Hyprland's global frame so `area_tracker.rs` can compare
+                // them directly against live `compositor::cursor_pos()`
+                // reads without a per-event conversion.
+                let (ox, oy) = overlay_monitor_origin().await.unwrap_or_else(|| {
+                    eprintln!("ee2-hyprland: track-area: no monitor origin resolved, using unconverted coordinates");
+                    (0, 0)
+                });
+                let (ox, oy) = (ox as f64, oy as f64);
+
+                let session = area_tracker::Session {
+                    hold: Modifier::from_name(hold_key),
+                    close_threshold,
+                    from: (f(from, "x") + ox, f(from, "y") + oy),
+                    area: area_tracker::Rect {
+                        x: f(area, "x") + ox,
+                        y: f(area, "y") + oy,
+                        width: f(area, "width"),
+                        height: f(area, "height"),
+                    },
+                };
+                match &self.area_tracker {
+                    Some(tx) => {
+                        let _ = tx.send(area_tracker::Cmd::Start(session));
+                    }
+                    None => eprintln!(
+                        "ee2-hyprland: track-area: area tracker not attached yet, ignoring"
+                    ),
+                }
+            }
+            "CLIENT->MAIN::write-data" | "CLIENT->MAIN::re-parse-log" => {
+                // Logged, not acted on — same as host.mjs. Session/OCR
+                // logging (`write-data`) is still Stage 5+ territory.
             }
             other => {
                 eprintln!("ee2-hyprland: unhandled WS event: {other}");
