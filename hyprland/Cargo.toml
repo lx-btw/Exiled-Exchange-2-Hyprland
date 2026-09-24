@@ -11,10 +11,16 @@ name = "ee2-hyprland"
 path = "src/main.rs"
 
 [dependencies]
-# async runtime + HTTP/WS host server (mirrors host.mjs's http+ws server)
+# async runtime + HTTP/WS host server (mirrors host.mjs's http+ws server) —
+# WS `/events` uses axum's own built-in WebSocket support (`ws` feature)
+# rather than driving tokio-tungstenite directly, so that's not a separate
+# dependency here even though axum uses it internally. `futures-util` gives
+# WebSocket's Stream/Sink impls `.split()`/`.next()`/`.send()` — axum
+# depends on it too, but that doesn't make it usable here without also
+# depending on it directly.
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
-tokio-tungstenite = "0.30"
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
 
 # overlay window: layer-shell surface + WebView, see overlay/
 #
@@ -43,13 +49,20 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # tray icon (replaces AppTray.ts)
 ksni = "0.3"
 
-# renderer/dist embedded into the binary at build time
-rust-embed = "8"
+# renderer/dist embedded into the binary at build time. `mime-guess` gets us
+# per-file Content-Type without a separate mime_guess dependency of our own.
+rust-embed = { version = "8", features = ["mime-guess"] }
 
 # config parsing (upstream config.json is plain JSON; poe2_production_Config.ini
 # needs an ini-style parser for GameConfig.ts's showModsKey — Stage 5)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# outbound HTTPS relay to trade-site APIs (proxy.rs) — rustls instead of the
+# default (native-tls/OpenSSL) backend, no system TLS lib dependency. No
+# `cookies` feature: proxy.rs manages its own per-host jar, matching
+# upstream's manual Partitioned-attribute stripping (see proxy.rs docs).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 
 # misc
 tempfile = "3"
