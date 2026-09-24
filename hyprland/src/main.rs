@@ -29,6 +29,29 @@ use gtk4::prelude::*;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 fn main() -> gtk4::glib::ExitCode {
+    // Render-storm fix (PLAN.md, "Storm mechanism" / Session 7): every
+    // `overlay::window::set_visible(true)` after a `set_visible(false)`
+    // makes gtk4-layer-shell destroy and recreate the surface's
+    // `zwlr_layer_surface_v1` role. WebKit's accelerated (DMA-BUF/EGL)
+    // compositing path gets stuck across that recreation — it never
+    // attaches a buffer again, so GTK's frame clock free-runs, acking and
+    // committing an empty `zwlr_layer_surface_v1.configure` roughly every
+    // 16ms forever (confirmed both live, via the tray's "Toggle Overlay"
+    // with no game running, and in `examples/transparency_lab.rs`
+    // `EE2_LAB_STORM_REPRO=buggy|fixed|show_only`, all three of which
+    // storm regardless of when/whether keyboard mode or the input region
+    // change — only the hide→show cycle itself matters, isolated by
+    // `EE2_LAB_STORM_REPRO=runtime`, which never storms). Falls through
+    // WebKit's non-accelerated path instead, which re-attaches a real
+    // buffer through the *window's own* surface every time and never gets
+    // stuck (confirmed with the same lab harness). Must be set before any
+    // WebKit/GTK object is created — WebKitGTK reads it at library init.
+    // SAFETY: first line of `main`, no other thread exists yet to race on
+    // the process environment.
+    unsafe {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
+
     // GTK owns the main thread's event loop (`app.run_with_args` below), so
     // everything else — server, hotkeys, compositor focus tracking — runs
     // on its own tokio runtime on a background OS thread instead of

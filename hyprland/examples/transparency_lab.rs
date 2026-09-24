@@ -67,6 +67,37 @@
 //!                                  content is what triggers the render
 //!                                  storm (PLAN.md E4), since a static page
 //!                                  alone does not.
+//!   EE2_LAB_STORM_REPRO=buggy|fixed|runtime
+//!                                  Minimal repro/verification for the
+//!                                  storm mechanism narrowed from the E0
+//!                                  trace (PLAN.md, "Storm mechanism"):
+//!                                  starts hidden (same `present()` then
+//!                                  `set_visible(false)` sequence as
+//!                                  `main.rs`), then 2s later fires one
+//!                                  GTK-callback transition.
+//!                                  "buggy" replays the exact real ordering
+//!                                  (`state.rs::set_passthrough_on_main_thread`
+//!                                  + `window.rs::set_passthrough`):
+//!                                  `set_visible(true)`, then input region,
+//!                                  then `KeyboardMode::Exclusive` — i.e.
+//!                                  keyboard/region land *after* the
+//!                                  unbuffered initial commit `set_visible`
+//!                                  triggers. "fixed" reorders it: input
+//!                                  region + keyboard mode while still
+//!                                  hidden, `set_visible(true)` last (fix
+//!                                  variant A attempt). "runtime" never
+//!                                  hides at all (surface mapped and
+//!                                  rendering since creation) — only the
+//!                                  keyboard mode + input region change
+//!                                  fires at the 2s mark, isolating that
+//!                                  from the hide/show remap (gtk4-layer-shell
+//!                                  destroys and recreates the
+//!                                  `zwlr_layer_surface_v1` role object on
+//!                                  every `set_visible` cycle). Overrides
+//!                                  EE2_LAB_INTERACTIVE (initial state is
+//!                                  always passthrough/None, matching
+//!                                  `main.rs`'s real startup, regardless of
+//!                                  that flag).
 //!
 //! Every mode draws a semi-transparent magenta marker box in the corner
 //! (rgba, 40% alpha) as a position/blend sanity check distinct from the
@@ -94,6 +125,7 @@ fn main() -> gtk4::glib::ExitCode {
     let apply_style = env_flag("EE2_LAB_STYLE");
     let color_scheme = env_flag("EE2_LAB_COLOR_SCHEME");
     let bg_magenta = std::env::var("EE2_LAB_BG").as_deref() == Ok("magenta");
+    let storm_repro = std::env::var("EE2_LAB_STORM_REPRO").ok();
 
     eprintln!(
         "transparency-lab: engine={engine} css={apply_css} style={apply_style} color_scheme={color_scheme} bg_magenta={bg_magenta}"
@@ -184,7 +216,7 @@ fn main() -> gtk4::glib::ExitCode {
         // test whether keyboard-exclusive-over-a-live-fullscreen-game
         // (independent of WebKit/app logic/translucency alone, both
         // already ruled out) is what triggers the render storm.
-        let interactive = env_flag("EE2_LAB_INTERACTIVE");
+        let interactive = storm_repro.is_none() && env_flag("EE2_LAB_INTERACTIVE");
         window.set_keyboard_mode(if interactive {
             KeyboardMode::Exclusive
         } else {
@@ -231,6 +263,70 @@ fn main() -> gtk4::glib::ExitCode {
         }
 
         window.present();
+
+        if let Some(mode) = storm_repro.clone() {
+            // Same startup sequence as `main.rs`: `present()` only to force
+            // `realize` (so `connect_realize` above runs and sets the
+            // initial passthrough input region), then hide — except
+            // "runtime", which never hides at all (isolates the hide/show
+            // remap itself, vs. the keyboard/region change, as the storm
+            // trigger).
+            if mode != "runtime" {
+                window.set_visible(false);
+            }
+            let window = window.clone();
+            gtk4::glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                eprintln!("transparency-lab: storm_repro={mode} transition firing");
+                let full_region = || {
+                    gtk4::cairo::Region::create_rectangle(&gtk4::cairo::RectangleInt::new(
+                        0, 0, 10000, 10000,
+                    ))
+                };
+                if mode == "show_only" {
+                    // Isolates the remap from the keyboard/region change
+                    // entirely: just `set_visible(true)`, keyboard mode and
+                    // input region left untouched (still None/empty from
+                    // startup).
+                    window.set_visible(true);
+                } else if mode == "runtime" {
+                    // No hide/show at all — the surface has been mapped
+                    // and showing real content since creation. Only the
+                    // keyboard mode + input region change at runtime, to
+                    // isolate that from the hide/show remap (gtk4-layer-shell
+                    // destroys and recreates the zwlr_layer_surface_v1 role
+                    // object on every hide/show cycle, a candidate cause
+                    // noted in PLAN.md's E4 follow-up).
+                    if let Some(surface) = window.surface() {
+                        surface.set_input_region(Some(&full_region()));
+                    }
+                    window.set_keyboard_mode(KeyboardMode::Exclusive);
+                } else if mode == "fixed" {
+                    // Variant A: set keyboard mode + input region while
+                    // still hidden, show last — so `keyboard_interactivity`
+                    // goes out in the initial surface state, before the
+                    // initial commit, instead of after it.
+                    if let Some(surface) = window.surface() {
+                        surface.set_input_region(Some(&full_region()));
+                    }
+                    window.set_keyboard_mode(KeyboardMode::Exclusive);
+                    window.set_visible(true);
+                } else {
+                    // "buggy" (default for any other value): replays the
+                    // real ordering bug — `set_visible_on_main_thread`/
+                    // `set_passthrough_on_main_thread`'s
+                    // `set_visible(true)` first (gtk4-layer-shell maps the
+                    // surface and sends the initial commit with whatever
+                    // keyboard mode + input region it already had — None +
+                    // empty), then `set_passthrough`'s input region and
+                    // keyboard mode changes land after that initial commit.
+                    window.set_visible(true);
+                    if let Some(surface) = window.surface() {
+                        surface.set_input_region(Some(&full_region()));
+                    }
+                    window.set_keyboard_mode(KeyboardMode::Exclusive);
+                }
+            });
+        }
     });
 
     app.run_with_args::<&str>(&[])
