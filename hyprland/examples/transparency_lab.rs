@@ -49,6 +49,24 @@
 //!                                  Lets a test target an output with no
 //!                                  other clients on its active workspace,
 //!                                  without switching workspaces.
+//!   EE2_LAB_INTERACTIVE=1          KeyboardMode::Exclusive plus a real
+//!                                  (non-empty) input region, matching the
+//!                                  real overlay's state right after
+//!                                  `toggle-overlay` fires — added for the
+//!                                  render-storm diagnosis (PLAN.md E4) to
+//!                                  test whether keyboard-exclusive is what
+//!                                  triggers it, independent of WebKit
+//!                                  content or translucency. Default
+//!                                  (unset) keeps this lab's original
+//!                                  always-passthrough/`KeyboardMode::None`
+//!                                  posture.
+//!   EE2_LAB_ANIMATE=1              (webkit only) adds an infinite CSS
+//!                                  `@keyframes` spin animation to the
+//!                                  trivial page — tests whether
+//!                                  continuously-animating/repainting
+//!                                  content is what triggers the render
+//!                                  storm (PLAN.md E4), since a static page
+//!                                  alone does not.
 //!
 //! Every mode draws a semi-transparent magenta marker box in the corner
 //! (rgba, 40% alpha) as a position/blend sanity check distinct from the
@@ -159,20 +177,45 @@ fn main() -> gtk4::glib::ExitCode {
             }
         }
         window.set_namespace(Some("ee2-transparency-lab"));
-        window.set_keyboard_mode(KeyboardMode::None);
+        // EE2_LAB_INTERACTIVE=1: matches the real overlay's state right
+        // after `toggle-overlay` fires (`state.rs::set_interactive`) —
+        // KeyboardMode::Exclusive plus a full-window input region, instead
+        // of this lab's default always-passthrough/None posture. Added to
+        // test whether keyboard-exclusive-over-a-live-fullscreen-game
+        // (independent of WebKit/app logic/translucency alone, both
+        // already ruled out) is what triggers the render storm.
+        let interactive = env_flag("EE2_LAB_INTERACTIVE");
+        window.set_keyboard_mode(if interactive {
+            KeyboardMode::Exclusive
+        } else {
+            KeyboardMode::None
+        });
 
         match engine.as_str() {
             "gtk" => build_gtk_mode(&window),
             _ => build_webkit_mode(&window, apply_style, color_scheme, bg_magenta),
         }
 
-        window.connect_realize(|window| {
+        window.connect_realize(move |window| {
             let Some(surface) = window.surface() else {
                 return;
             };
-            // Passthrough for mouse — this lab never wants to steal
-            // clicks, only observe rendering.
-            surface.set_input_region(Some(&gtk4::cairo::Region::create()));
+            if interactive {
+                // Full-window input region — same as the real overlay's
+                // interactive mode. Exact size doesn't need to be
+                // pixel-perfect for this diagnostic (unlike the real fix in
+                // `window.rs`, which needs correct hit-testing); a large
+                // fixed rectangle gets the same real effect on the
+                // compositor side (a genuinely non-empty input region, not
+                // click-through) without needing to track allocation.
+                surface.set_input_region(Some(&gtk4::cairo::Region::create_rectangle(
+                    &gtk4::cairo::RectangleInt::new(0, 0, 10000, 10000),
+                )));
+            } else {
+                // Passthrough for mouse — this lab never wants to steal
+                // clicks, only observe rendering.
+                surface.set_input_region(Some(&gtk4::cairo::Region::create()));
+            }
             if env_flag("EE2_LAB_OPAQUE_REGION_NONE") {
                 surface.set_opaque_region(None);
             }
@@ -259,6 +302,21 @@ fn build_webkit_mode(
     } else {
         ""
     };
+    // EE2_LAB_ANIMATE=1: an infinite CSS animation (mimics a perpetual
+    // loading spinner / continuous repaint activity), to test whether
+    // continuously-animating content over a live fullscreen game is what
+    // triggers the configure-storm regression, independent of translucency
+    // or keyboard-exclusive interactivity alone (both already ruled out
+    // this session against the real game).
+    let animate = env_flag("EE2_LAB_ANIMATE");
+    let spinner = if animate {
+        r#"<div style="position:fixed;top:120px;left:20px;width:40px;height:40px;
+                border:6px solid rgba(255,255,255,0.2);border-top-color:#fff;
+                border-radius:50%;animation:spin 1s linear infinite;"></div>
+<style>@keyframes spin { to { transform: rotate(360deg); } }</style>"#
+    } else {
+        ""
+    };
     let html = format!(
         r#"<!doctype html><html><head>{color_scheme_meta}</head>
 <body style="margin:0;background:transparent">
@@ -267,6 +325,7 @@ fn build_webkit_mode(
             padding:10px;box-sizing:border-box;">
 WebKit marker rgba(255,0,255,0.4)
 </div>
+{spinner}
 </body></html>"#
     );
     webview.load_html(&html, None);
