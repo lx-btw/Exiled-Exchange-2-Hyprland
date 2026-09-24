@@ -28,8 +28,10 @@ gtk4 = { version = "0.11", features = ["v4_10"] }
 gtk4-layer-shell = "0.8"
 webkit6 = "0.6"
 
-# input: evdev read (hotkeys, no EVIOCGRAB) + uinput virtual keyboard (injection)
-evdev = "0.13"
+# input: evdev read (hotkeys, no EVIOCGRAB) + uinput virtual keyboard (injection).
+# `tokio` feature gives `Device::into_event_stream()` (async reads, needed so
+# hotkeys.rs doesn't block the runtime the axum server and GTK share).
+evdev = { version = "0.13", features = ["tokio"] }
 
 # clipboard: wlr-data-control-unstable-v1, event-driven (see clipboard.rs)
 wayland-client = "0.31"
