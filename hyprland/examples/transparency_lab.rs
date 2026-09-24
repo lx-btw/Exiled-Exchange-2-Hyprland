@@ -128,6 +128,15 @@ fn main() -> gtk4::glib::ExitCode {
             }
         });
 
+        if env_flag("EE2_LAB_OPAQUE_REGION_EVERY_FRAME") {
+            window.add_tick_callback(|window, _clock| {
+                if let Some(surface) = window.surface() {
+                    surface.set_opaque_region(None);
+                }
+                gtk4::glib::ControlFlow::Continue
+            });
+        }
+
         window.present();
     });
 
