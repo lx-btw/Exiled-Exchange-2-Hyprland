@@ -68,7 +68,19 @@ serde_json = "1"
 # default (native-tls/OpenSSL) backend, no system TLS lib dependency. No
 # `cookies` feature: proxy.rs manages its own per-host jar, matching
 # upstream's manual Partitioned-attribute stripping (see proxy.rs docs).
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+# gzip/brotli/zstd/deflate: matches upstream's own decompression model —
+# Electron's `net.request` decompresses transparently at the network-stack
+# level, so `main/src/proxy.ts` never has to think about it. reqwest does
+# the same *only* as long as we don't forward the renderer's own
+# `Accept-Encoding` (see proxy.rs::request_headers) — setting these
+# features alone isn't sufficient without that.
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "rustls",
+    "gzip",
+    "brotli",
+    "zstd",
+    "deflate",
+] }
 
 # misc
 tempfile = "3"
