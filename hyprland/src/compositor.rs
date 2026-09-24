@@ -77,6 +77,23 @@ struct CursorPos {
     y: i32,
 }
 
+/// One entry of `hyprctl -j devices`'s `keyboards` array — only the fields
+/// `input/grab.rs`'s per-device XKB layout sync actually needs (see
+/// HYPRLAND-NOTES.md §9). `name` is Hyprland's own mangled device name
+/// (lowercased, non-alphanumeric runs collapsed to `-`), not
+/// `evdev::Device::name()`'s raw string — `grab.rs::hypr_device_name()`
+/// reproduces the transform.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeyboardDevice {
+    pub name: String,
+    pub active_layout_index: i32,
+}
+
+#[derive(Deserialize)]
+struct DevicesReply {
+    keyboards: Vec<KeyboardDevice>,
+}
+
 /// Sends `command` (e.g. `"j/clients"` — the `j/` prefix requests JSON) to
 /// `.socket.sock` and returns the full reply. Hyprland closes the connection
 /// once it's written the response, so "read to EOF" is the whole protocol.
@@ -133,6 +150,38 @@ pub async fn cursor_pos() -> io::Result<(i32, i32)> {
     let raw = command("j/cursorpos").await?;
     let pos: CursorPos = serde_json::from_str(&raw).map_err(io::Error::other)?;
     Ok((pos.x, pos.y))
+}
+
+/// The `keyboards` array from `hyprctl -j devices` — used by
+/// `input/grab.rs` to read a physical device's current XKB layout index
+/// before grabbing it (so the mirror device can be set to match) and the
+/// mirror's own index before ungrabbing (so the physical device gets back
+/// whatever the user toggled to while it was grabbed). See
+/// HYPRLAND-NOTES.md §9.
+pub async fn keyboards() -> io::Result<Vec<KeyboardDevice>> {
+    let raw = command("j/devices").await?;
+    let reply: DevicesReply = serde_json::from_str(&raw).map_err(io::Error::other)?;
+    Ok(reply.keyboards)
+}
+
+/// Sets `device`'s active XKB layout to `index` (0-based into its
+/// `layout`/`options` list — `"us,ru"` here, so `0` is `us`, `1` is `ru`).
+///
+/// **Empirically confirmed to require the short-form command, not
+/// `dispatch switchxkblayout ...`** (2026-09-24, see HYPRLAND-NOTES.md §9):
+/// this system's Hyprland config loads a Lua scripting layer (the same one
+/// §3 references via `hl.bind`/`hl.dsp`) that intercepts the `dispatch`
+/// socket command and tries to parse its argument as Lua source — `dispatch
+/// switchxkblayout <name> <index>` fails there with a Lua syntax error. The
+/// short-form command (`switchxkblayout <name> <index>`, no `dispatch`
+/// prefix — what `hyprctl`'s own CLI sends for a handful of common
+/// dispatchers) bypasses that layer entirely. Verified live against a real
+/// device: `switchxkblayout steelseries-steelseries-apex-7-tkl 0` returned
+/// `ok`, confirmed by a follow-up `j/devices` read showing
+/// `active_layout_index: 0`.
+pub async fn switchxkblayout(device: &str, index: i32) -> io::Result<()> {
+    command(&format!("switchxkblayout {device} {index}")).await?;
+    Ok(())
 }
 
 /// Finds the game window among `clients` — `clients().await` filtered by

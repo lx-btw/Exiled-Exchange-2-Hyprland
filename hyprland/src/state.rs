@@ -16,12 +16,11 @@
 //! Stage 4 (see PLAN.md).
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex as TokioMutex};
 
 use crate::area_tracker;
 use crate::clipboard::{self, ClipboardEvent};
@@ -237,17 +236,23 @@ pub struct Overlay {
     hotkey_bindings: Bindings,
     events_tx: broadcast::Sender<Value>,
     game_active: bool,
-    /// Mirrors `game_active`, but as an `Arc<AtomicBool>` `hotkeys.rs::watch()`
-    /// reads on every keydown to decide whether to even attempt matching —
-    /// ports upstream's `Shortcuts.ts`: `poeWindow.on("active-change", ...)`
-    /// calls `globalShortcut` `register()`/`unregister()`, so hotkeys only
-    /// fire while PoE2 is the focused window. This fork's evdev listener has
-    /// no equivalent "unregister" (it never grabs anything, see hotkeys.rs's
-    /// own docs), so the gate has to be a flag it checks instead. Found
-    /// missing live (2026-09-24): without it, e.g. `Shift + Space` toggled
-    /// the overlay from *any* focused window, not just the game — a real
-    /// behavioral gap from upstream, not a hypothetical.
-    hotkeys_active: Arc<AtomicBool>,
+    /// Mirrors `game_active` out to `hotkeys.rs::watch()` — a `watch::Sender`
+    /// rather than a plain `Arc<AtomicBool>` (changed 2026-09-24, H2A) so
+    /// that loop can react to a focus change the instant it happens (via
+    /// `select!` on `.changed()`), not only on the next keystroke. That
+    /// distinction didn't matter before capture existed (matching was
+    /// stateless either way), but it does now: capture needs to grab a
+    /// device the moment the game gains focus, or the very first hotkey
+    /// press after every alt-tab leaks its trigger key into the game (see
+    /// PLAN.md's H2 entry) — an `Arc<AtomicBool>` gives no way to wait for
+    /// that transition, only to poll it. Ports upstream's `Shortcuts.ts`:
+    /// `poeWindow.on("active-change", ...)` calls `globalShortcut`
+    /// `register()`/`unregister()`, so hotkeys only fire (and capture only
+    /// grabs) while PoE2 is the focused window. Found missing live
+    /// (2026-09-24): without some form of this gate, e.g. `Shift + Space`
+    /// toggled the overlay from *any* focused window, not just the game — a
+    /// real behavioral gap from upstream, not a hypothetical.
+    hotkeys_active: watch::Sender<bool>,
     overlay_interactive: bool,
     interactive_since: Instant,
     /// Ports upstream's `OverlayWindow.wasUsedRecently` (default `true`),
@@ -286,11 +291,13 @@ impl Overlay {
     /// needs — created here (empty/false) rather than in `main.rs`, since
     /// `update_host_config`/`set_game_active` are what actually populate
     /// them and that only makes sense as `Overlay` methods.
-    pub fn new(events_tx: broadcast::Sender<Value>) -> std::io::Result<(Self, Bindings, Arc<AtomicBool>)> {
+    pub fn new(
+        events_tx: broadcast::Sender<Value>,
+    ) -> std::io::Result<(Self, Bindings, watch::Receiver<bool>)> {
         let keyboard = VirtualKeyboard::new()?;
         let clipboard_rx = clipboard::spawn()?;
         let hotkey_bindings: Bindings = Arc::new(StdMutex::new(Vec::new()));
-        let hotkeys_active = Arc::new(AtomicBool::new(false));
+        let (hotkeys_active_tx, hotkeys_active_rx) = watch::channel(false);
 
         let overlay = Self {
             config_store: ConfigStore::new(),
@@ -304,14 +311,14 @@ impl Overlay {
             hotkey_bindings: hotkey_bindings.clone(),
             events_tx,
             game_active: false,
-            hotkeys_active: hotkeys_active.clone(),
+            hotkeys_active: hotkeys_active_tx,
             overlay_interactive: false,
             interactive_since: Instant::now(),
             used_recently: true,
             area_tracker: None,
             self_ref: Weak::new(),
         };
-        Ok((overlay, hotkey_bindings, hotkeys_active))
+        Ok((overlay, hotkey_bindings, hotkeys_active_rx))
     }
 
     /// See `self_ref`'s docs — must be called once, right after `Overlay` is
@@ -382,7 +389,7 @@ impl Overlay {
             return;
         }
         self.game_active = active;
-        self.hotkeys_active.store(active, Ordering::Relaxed);
+        let _ = self.hotkeys_active.send(active);
         self.send_focus_change(false);
     }
 

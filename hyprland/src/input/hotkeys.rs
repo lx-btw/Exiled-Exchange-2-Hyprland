@@ -1,31 +1,80 @@
-//! evdev hotkey listener. Opens `/dev/input/event*` read-only — **never**
-//! `EVIOCGRAB` — and watches for the shortcut combos defined in the user's
-//! `config.json` in parallel with everything else on the system. The game
-//! keeps receiving every keypress completely normally.
+//! evdev hotkey listener **and** keyd-style input capture. Opens
+//! `/dev/input/event*` for every device that looks like a keyboard (see
+//! `open_keyboards()`) and watches for the configured combos — but now also
+//! `EVIOCGRAB`s each one (via `grab.rs::Capture`) while the game is
+//! focused, re-emitting everything through a separate `uinput` mirror
+//! device except the matched trigger key of a fired hotkey.
 //!
-//! Merges modifier state across all open keyboard devices into one logical
-//! state machine (handles multiple physical keyboards): held keys are
-//! tracked per `(device, keycode)` pair rather than in one shared bitset, so
-//! releasing a modifier on one keyboard can't spuriously clear it while a
-//! second physical keyboard still holds its own copy of that key — the
-//! failure mode a single shared bitset would have.
+//! **Capture policy — read this before changing anything here or in
+//! `grab.rs`.** Corrected 2026-09-24: earlier revisions of this file,
+//! `CLAUDE.md`, and `HYPRLAND-NOTES.md` §3 stated a blanket "never
+//! `EVIOCGRAB`" rule. That was a misreading of the actual constraint — the
+//! real, still-load-bearing rule is narrower: this app never touches
+//! Hyprland's own *config* (no `bind`, no `windowrule`, no `keyword`, no
+//! `hyprctl keyword`/`eval`), not that it never grabs a device. Without a
+//! grab, a hotkey's own trigger key (`D` in `Ctrl+D`, `Space` in
+//! `Shift+Space`) still reached the game underneath and performed whatever
+//! it's bound to there (a step, a dodge-roll) on *every* press — see
+//! PLAN.md's H2 entry.
 //!
-//! Matching is **exact modifier-set equality**, not "at least these held":
-//! upstream's `globalShortcut.register()` treats `"Ctrl + D"` and
-//! `"Ctrl + Alt + D"` as independent accelerators, so pressing Ctrl+Alt+D
-//! must not also fire a registered "Ctrl + D". No synthetic key-release step
-//! is needed here the way upstream's uiohook-based `register()` handler
-//! needs one (`entry.shortcut.split(" + ").forEach(key => keyToggle(key,
-//! "up"))`) — that exists only because Electron's `globalShortcut` consumes
-//! the real event before the OS delivers a natural key-up; since we never
-//! grab anything, the physical keyboard's own up-events always arrive
-//! normally regardless of what we do here.
+//! - Only real hardware keyboards are ever grabbed — never `inject.rs`'s
+//!   injection device or `grab.rs`'s own mirror device (both excluded by
+//!   name in `open_keyboards()`, same mechanism that already excluded the
+//!   injector before capture existed). The mouse is never grabbed (it
+//!   isn't enumerated here at all — see `open_keyboards()`'s `KEY_A`
+//!   filter).
+//! - Grab is active only while the game is focused — `game_active` is now
+//!   a `watch::Receiver<bool>` rather than the old `Arc<AtomicBool>`; the
+//!   switch to `watch` is what lets this loop react to a focus change
+//!   immediately (via `select!`), instead of only noticing on the next
+//!   keystroke, which would otherwise leak exactly the first press after
+//!   every alt-tab back into the game.
+//! - A grab/ungrab transition only happens at a moment nothing is held on
+//!   that specific device — checked against this loop's own per-`(fd,
+//!   code)` `held` set, filtered to one device. If something's held when
+//!   the desired state changes, the transition is deferred until that
+//!   device's own next key-release. This is what stops a modifier from
+//!   being reported stuck to Hyprland: a modifier already pressed *before*
+//!   a grab engages has already had its press event delivered to whatever
+//!   had focus at the time; grabbing mid-hold would swallow its eventual
+//!   release, and nothing downstream would ever see that key go up.
+//! - Whatever a grabbed device produces that isn't consumed is re-emitted,
+//!   immediately, through `grab.rs::Capture`'s mirror device — a *second*,
+//!   separate `uinput` device from `inject.rs`'s (mixing the `Ctrl+Alt+C`
+//!   injector's own timed sequences with live passthrough typing on the
+//!   same device would race the two). Consumed = only a matched hotkey's
+//!   own trigger-key press, its repeats, and its release; every modifier
+//!   key passes through untouched, on every device, always.
+//! - Per-device XKB layout (`us,ru` / `grp:alt_shift_toggle`) is
+//!   synchronized at each transition (`grab.rs`, HYPRLAND-NOTES.md §9), so
+//!   a device grabbed mid-`ru` doesn't suddenly type through the mirror's
+//!   own independent (always `us`-default) XKB state, and releasing the
+//!   grab hands the physical device back whatever layout the user last
+//!   toggled to while typing through the mirror.
+//! - No timers anywhere in this path. `evdev::Device` ungrabs itself on
+//!   `Drop`, and `EVIOCGRAB` is fd-scoped kernel state the kernel already
+//!   releases on any process exit, `SIGKILL` included.
+//! - **Known limitation, not implemented**: Caps Lock / Num Lock LED state
+//!   isn't forwarded from the mirror back to the grabbed physical keyboard
+//!   — see `grab.rs`'s module docs for why (the evdev crate's safe uinput
+//!   builder API has no way to declare `EV_LED` capability without an
+//!   `unsafe` ioctl call this codebase doesn't otherwise need).
+//!
+//! Everything below is unchanged from before capture existed: modifier
+//! state is still merged across every open keyboard device into one
+//! logical state machine — held keys tracked per `(device, keycode)` pair
+//! rather than a shared bitset, so releasing a modifier on one keyboard
+//! can't spuriously clear it while a second physical keyboard still holds
+//! its own copy — and matching is still **exact modifier-set equality**,
+//! not "at least these held": upstream's `globalShortcut.register()` treats
+//! `"Ctrl + D"` and `"Ctrl + Alt + D"` as independent accelerators, so
+//! pressing Ctrl+Alt+D must not also fire a registered "Ctrl + D".
 //!
 //! Ported from upstream's `main/src/shortcuts/Shortcuts.ts` dispatch logic,
-//! but the registration mechanism (`globalShortcut`) is not — this listens,
-//! it never grabs or registers anything with the compositor.
+//! but the registration mechanism (`globalShortcut`) is not — this never
+//! registers a bind with the compositor, it captures at the evdev layer.
 //!
-//! Stage 2 (see PLAN.md). Design rationale: HYPRLAND-NOTES.md §3.
+//! Stage 2/5, H2A (see PLAN.md). Design rationale: HYPRLAND-NOTES.md §3, §9.
 //! Fallback if merging modifier state across multiple keyboards proves
 //! unreliable: track only the device that produced the last keydown.
 
@@ -35,8 +84,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use evdev::{Device, EventSummary, KeyCode};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+use super::grab::Capture;
 use super::inject::VIRTUAL_KEYBOARD_NAME;
 use super::keymap::{Modifier, Shortcut};
 
@@ -104,17 +154,20 @@ impl ModifierState {
 /// Opens every device evdev finds under `/dev/input` that looks like a
 /// keyboard (reports `KEY_A` — filters out mice/joysticks, which also emit
 /// `EV_KEY` for their buttons but never letter keys) — **except our own**
-/// `inject.rs` virtual device. That device advertises the same letter/
-/// modifier capability set a real keyboard does, so without this exclusion
-/// every key we inject would loop right back into the matcher below: a
-/// shortcut bound to exactly `Ctrl+Alt+C` (plausible — that's PoE2's own
-/// advanced-item-description combo) would re-trigger itself indefinitely,
-/// and any injected modifier would pollute the global held-modifier state
-/// for every other shortcut while it's down.
+/// `inject.rs` and `grab.rs` virtual devices. Both advertise the same
+/// letter/modifier capability set a real keyboard does, so without this
+/// exclusion every key either of them emits would loop right back into the
+/// matcher below (and, for capture, straight back into the grab-candidate
+/// list as if a second physical keyboard had appeared) — the exact
+/// self-triggering feedback loop PLAN.md documents as an already-happened
+/// real bug for `inject.rs`'s device (Stage 2 review).
 fn open_keyboards() -> Vec<Device> {
     evdev::enumerate()
         .filter_map(|(_path, device)| {
-            if device.name() == Some(VIRTUAL_KEYBOARD_NAME) {
+            let name = device.name();
+            if name == Some(VIRTUAL_KEYBOARD_NAME)
+                || name == Some(super::grab::MIRROR_KEYBOARD_NAME)
+            {
                 return None;
             }
             let is_keyboard = device
@@ -134,16 +187,16 @@ fn open_keyboards() -> Vec<Device> {
 /// matter in practice).
 ///
 /// `game_active` (`state.rs`'s `hotkeys_active`, updated from
-/// `set_game_active`) gates matching: ports upstream's `Shortcuts.ts`
-/// `poeWindow.on("active-change", ...)` → `register()`/`unregister()`, so
-/// a shortcut like `Shift + Space` only fires while PoE2 is the focused
-/// window, not from every other application too. Modifier/held-key
-/// bookkeeping still runs regardless of this flag — only the match-and-fire
-/// step is skipped — so state stays accurate for whenever the game becomes
-/// active again, instead of going stale while it's not.
+/// `set_game_active`) gates both matching and capture: ports upstream's
+/// `Shortcuts.ts` `poeWindow.on("active-change", ...)` →
+/// `register()`/`unregister()`, so a shortcut like `Shift + Space` only
+/// fires while PoE2 is the focused window, and a device is only grabbed
+/// while it is too. Modifier/held-key bookkeeping still runs regardless of
+/// this flag — only match-and-fire and the grab itself are gated — so state
+/// stays accurate for whenever the game becomes active again.
 pub async fn watch(
     bindings: Bindings,
-    game_active: Arc<AtomicBool>,
+    mut game_active: watch::Receiver<bool>,
     modifiers: Arc<ModifierState>,
     tx: mpsc::UnboundedSender<usize>,
 ) {
@@ -152,6 +205,25 @@ pub async fn watch(
         eprintln!("ee2-hyprland: no keyboard-like /dev/input device found — hotkeys disabled");
         return;
     }
+
+    // `Capture::new` needs to read every device's name/capabilities before
+    // any of them are moved into their own reader task below. A failure
+    // here (uinput unavailable, permission denied) degrades to the
+    // pre-capture behavior — hotkeys still match and fire, they just never
+    // grab anything and the H2 leak-on-first-press bug is back — rather
+    // than taking the whole hotkey listener down with it.
+    let mut capture = match Capture::new(&devices) {
+        Ok(capture) => Some(capture),
+        Err(err) => {
+            eprintln!(
+                "ee2-hyprland: failed to create input-capture mirror device: {err} — \
+                 hotkeys will still fire but their trigger key will leak into the game \
+                 (pre-H2 behavior)"
+            );
+            None
+        }
+    };
+    let capture_enabled = capture.is_some();
 
     enum DeviceMsg {
         Event(evdev::InputEvent),
@@ -164,10 +236,24 @@ pub async fn watch(
     }
 
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<(RawFd, DeviceMsg)>();
+    let mut fds: Vec<RawFd> = Vec::new();
 
     for device in devices {
         let fd = device.as_raw_fd();
+        fds.push(fd);
         let events_tx = events_tx.clone();
+
+        // Always created, even when capture is disabled: the receiver is
+        // moved into the reader task below either way, but its branch is
+        // gated on `capture_enabled` (see that task) so it's never polled
+        // when there's no sender registered anywhere to feed it — polling
+        // a channel whose only sender was just dropped returns `None`
+        // forever, which would busy-loop `select!` without that guard.
+        let (grab_tx, mut grab_rx) = mpsc::unbounded_channel::<bool>();
+        if let Some(capture) = capture.as_mut() {
+            capture.register_device(fd, grab_tx);
+        }
+
         let mut stream = match device.into_event_stream() {
             Ok(stream) => stream,
             Err(err) => {
@@ -177,16 +263,37 @@ pub async fn watch(
         };
         tokio::spawn(async move {
             loop {
-                match stream.next_event().await {
-                    Ok(event) => {
-                        if events_tx.send((fd, DeviceMsg::Event(event))).is_err() {
-                            return;
+                tokio::select! {
+                    event = stream.next_event() => {
+                        match event {
+                            Ok(event) => {
+                                if events_tx.send((fd, DeviceMsg::Event(event))).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("ee2-hyprland: input device read error: {err}");
+                                let _ = events_tx.send((fd, DeviceMsg::Closed));
+                                return;
+                            }
                         }
                     }
-                    Err(err) => {
-                        eprintln!("ee2-hyprland: input device read error: {err}");
-                        let _ = events_tx.send((fd, DeviceMsg::Closed));
-                        return;
+                    Some(want_grabbed) = grab_rx.recv(), if capture_enabled => {
+                        // The grab/ungrab syscall itself: only this task
+                        // owns the `Device` handle for this fd, so the
+                        // central loop below can only ask for it via this
+                        // channel, never perform it directly.
+                        let result = if want_grabbed {
+                            stream.device_mut().grab()
+                        } else {
+                            stream.device_mut().ungrab()
+                        };
+                        if let Err(err) = result {
+                            eprintln!(
+                                "ee2-hyprland: failed to {} input device: {err}",
+                                if want_grabbed { "grab" } else { "ungrab" }
+                            );
+                        }
                     }
                 }
             }
@@ -196,51 +303,124 @@ pub async fn watch(
 
     let mut held: HashSet<(RawFd, KeyCode)> = HashSet::new();
 
-    while let Some((fd, msg)) = events_rx.recv().await {
-        let event = match msg {
-            DeviceMsg::Closed => {
-                held.retain(|(held_fd, _)| *held_fd != fd);
-                modifiers.update(&held);
-                continue;
+    // Engage capture immediately if the game is already focused when this
+    // starts — don't wait for the first keystroke to notice (that keystroke
+    // would otherwise leak straight through, the exact H2 bug this exists
+    // to fix).
+    if let Some(capture) = capture.as_mut() {
+        let active = *game_active.borrow();
+        capture.recheck_all(&fds, active, &held).await;
+    }
+
+    loop {
+        tokio::select! {
+            msg = events_rx.recv() => {
+                let Some((fd, msg)) = msg else { break };
+
+                let event = match msg {
+                    DeviceMsg::Closed => {
+                        held.retain(|(held_fd, _)| *held_fd != fd);
+                        modifiers.update(&held);
+                        if let Some(capture) = capture.as_mut() {
+                            capture.forget_device(fd);
+                        }
+                        continue;
+                    }
+                    DeviceMsg::Event(event) => event,
+                };
+
+                let EventSummary::Key(_, code, value) = event.destructure() else {
+                    continue;
+                };
+                let grabbed = capture.as_ref().is_some_and(|c| c.is_grabbed(fd));
+
+                match value {
+                    // Keydown (1) — record it, check for a match, and (while
+                    // grabbed) eat exactly the matched hotkey's own trigger
+                    // key so it doesn't also perform its native in-game
+                    // action. Repeat (2) carries no new information for
+                    // shortcut *matching*, but still needs forwarding or
+                    // eating depending on whether its press was eaten.
+                    1 => {
+                        held.insert((fd, code));
+                        modifiers.update(&held);
+
+                        let mut consumed = false;
+                        let game_is_active = *game_active.borrow();
+                        if game_is_active {
+                            let ctrl = is_held(&held, Modifier::Ctrl.keycodes());
+                            let shift = is_held(&held, Modifier::Shift.keycodes());
+                            let alt = is_held(&held, Modifier::Alt.keycodes());
+
+                            let current = bindings.lock().unwrap().clone();
+                            for (shortcut, index) in &current {
+                                if shortcut.key == code
+                                    && shortcut.ctrl == ctrl
+                                    && shortcut.shift == shift
+                                    && shortcut.alt == alt
+                                {
+                                    if grabbed {
+                                        consumed = true;
+                                    }
+                                    if tx.send(*index).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(capture) = capture.as_mut() {
+                            if consumed {
+                                capture.mark_eaten(fd, code);
+                            } else if grabbed {
+                                capture.forward(code, 1);
+                            }
+                        }
+                    }
+                    2 => {
+                        if grabbed {
+                            let eaten = capture.as_ref().is_some_and(|c| c.is_eaten(fd, code));
+                            if !eaten {
+                                if let Some(capture) = capture.as_mut() {
+                                    capture.forward(code, 2);
+                                }
+                            }
+                        }
+                    }
+                    0 => {
+                        held.remove(&(fd, code));
+                        modifiers.update(&held);
+
+                        if grabbed {
+                            let eaten = capture.as_mut().is_some_and(|c| c.take_eaten(fd, code));
+                            if !eaten {
+                                if let Some(capture) = capture.as_mut() {
+                                    capture.forward(code, 0);
+                                }
+                            }
+                        }
+
+                        if let Some(capture) = capture.as_mut() {
+                            let active = *game_active.borrow();
+                            capture.maybe_transition(fd, active, &held).await;
+                        }
+                    }
+                    _ => {}
+                }
             }
-            DeviceMsg::Event(event) => event,
-        };
-
-        let EventSummary::Key(_, code, value) = event.destructure() else {
-            continue;
-        };
-        match value {
-            // Keydown (1) — record it, then check for a match. Repeat (2)
-            // carries no new information for shortcut matching; ignore it.
-            1 => {
-                held.insert((fd, code));
-                modifiers.update(&held);
-
-                if !game_active.load(Ordering::Relaxed) {
+            changed = game_active.changed() => {
+                if changed.is_err() {
+                    // Sender (state.rs's Overlay) dropped — the process is
+                    // shutting down. Keep reading events on whatever state
+                    // capture last settled into rather than exiting this
+                    // loop early.
                     continue;
                 }
-
-                let ctrl = is_held(&held, Modifier::Ctrl.keycodes());
-                let shift = is_held(&held, Modifier::Shift.keycodes());
-                let alt = is_held(&held, Modifier::Alt.keycodes());
-
-                let current = bindings.lock().unwrap().clone();
-                for (shortcut, index) in &current {
-                    if shortcut.key == code
-                        && shortcut.ctrl == ctrl
-                        && shortcut.shift == shift
-                        && shortcut.alt == alt
-                        && tx.send(*index).is_err()
-                    {
-                        return;
-                    }
+                if let Some(capture) = capture.as_mut() {
+                    let active = *game_active.borrow();
+                    capture.recheck_all(&fds, active, &held).await;
                 }
             }
-            0 => {
-                held.remove(&(fd, code));
-                modifiers.update(&held);
-            }
-            _ => {}
         }
     }
 }

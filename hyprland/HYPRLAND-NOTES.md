@@ -83,32 +83,62 @@ The one place still worth being careful: input synthesis has no compositor-level
 API on any Wayland compositor (KWin's scripts can't type into clients either) — it
 goes around the compositor entirely, straight to `/dev/uinput`.
 
-## 3. Why hotkeys are read, not intercepted
+## 3. Why hotkeys are captured via evdev, never via a Hyprland bind
+
+**Corrected 2026-09-24**: earlier revisions of this section said hotkeys are "read,
+not intercepted" and that `EVIOCGRAB` is never used. That conflated two different
+things — the actual, still-load-bearing rule is about Hyprland's *config*, not about
+evdev grabbing. The corrected policy is below; see PLAN.md's H2 entry for why the
+blanket "never grab" version of this file caused a real, user-visible bug (a
+hotkey's own trigger key — `D` in `Ctrl+D`, `Space` in `Shift+Space` — still reached
+the game and performed its native action, a step or a dodge-roll, on every press).
 
 The prior local prototype (`~/ee2-hypr`) registered hotkeys as Hyprland config binds
 (`hl.bind("CTRL+D", hl.dsp.exec_cmd(...))`). This worked, but **it redefines that key
 combo globally** — any other application's binding to the same combo breaks, because
 Hyprland now routes it to us instead. That's the exact complaint this fork exists to
-fix.
-
-Instead, `input/hotkeys.rs` opens `/dev/input/event*` read-only (**never**
-`EVIOCGRAB`) and watches for the configured combos in parallel with everything else
-on the system. The game keeps receiving every keypress completely normally; we just
-also see it and react. This only works because the bound combos (default
-`Ctrl+D`/`Ctrl+Alt+D`/`Shift+Space`/`F5`/`F9`, user-configurable via the renderer's
-own settings UI same as upstream) aren't assigned to anything inside PoE2 itself —
-if a user rebinds a hotkey to something PoE2 also uses, that's a user-created
-conflict no interception scheme could avoid either.
-
-Corollary: **no Hyprland config file is ever touched.** No `bind`, no
+fix, and it's still true: **no Hyprland config file is ever touched.** No `bind`, no
 `windowrule` (a layer surface isn't addressable by window rules anyway — it isn't a
-window), no `keyword`. Verified empirically on the target system (Hyprland 0.56.2):
-`hyprctl keyword bind` silently registers a bind that never fires
+window), no `keyword`, no `hyprctl keyword`/`eval`. Verified empirically on the
+target system (Hyprland 0.56.2): `hyprctl keyword bind` silently registers a bind
+that never fires
 ([hyprwm/Hyprland#13994](https://github.com/hyprwm/Hyprland/discussions/13994)), and
 runtime `hl.bind`/`hl.unbind` via `hyprctl eval` has caused compositor crashes on
 this exact version ([yogeshojha/blip#9](https://github.com/yogeshojha/blip/issues/9))
 — dynamic Hyprland-config manipulation is avoided entirely, not merely because it's
 inelegant but because it's measurably unreliable on the version in use.
+
+What *is* used, deliberately, keyd-style (`input/hotkeys.rs` + `input/grab.rs`):
+`EVIOCGRAB` on real physical keyboard devices, scoped and guarded so it can't leak
+into the "redefines a combo globally" failure mode above:
+
+- **Only real hardware is ever grabbed** — never `inject.rs`'s injection device or
+  `grab.rs`'s own mirror device, excluded by name the same way the injector already
+  was before capture existed. The mouse is never grabbed.
+- **Grab is active only while the game is focused.** The instant focus leaves PoE2,
+  the device stops being grabbed (subject to the next point) and every other
+  application on the system gets its keys back completely normally — there is no
+  window where this redefines a combo for anything else running.
+- **A grab/ungrab transition only happens at a moment nothing is held on that
+  device**, checked against `hotkeys.rs`'s own per-`(fd, code)` held-key tracking
+  and deferred to the device's next key-release otherwise. Grabbing mid-hold would
+  swallow a modifier's eventual release event, which is exactly the "stuck
+  modifier" failure class `hl.dsp.send_shortcut` already has on this Hyprland
+  version (§4) — this rule exists to make sure capture can't reproduce it by a
+  different route.
+- **Whatever isn't the matched hotkey's own trigger-key edge is re-emitted
+  immediately** through a second `uinput` mirror device (`grab.rs::Mirror`,
+  deliberately separate from `inject.rs`'s device — mixing the `Ctrl+Alt+C`
+  injector's sequences with live passthrough typing on one device would race the
+  two). Modifiers always pass through, on every device, unconditionally — only a
+  matched hotkey's own base key (press, repeat, release) is ever consumed.
+- **Per-device XKB layout state is synchronized at each transition** — see §9. A
+  physical device grabbed mid-`ru` would otherwise go silent (typed keys reach the
+  mirror, which starts at its own independent default `us` state) or come back
+  desynced from whatever the user toggled to while typing through the mirror.
+- **No timers.** `evdev::Device` ungrabs itself on `Drop`, and `EVIOCGRAB` is
+  fd-scoped kernel state already released by the kernel on any process exit,
+  `SIGKILL` included — a crash needs no cleanup code here at all.
 
 ## 4. Key injection: uinput, not XTEST or compositor dispatch
 
@@ -220,3 +250,52 @@ data, same semantics, zero subprocess spawns per keypress.
   the user's `poe2_production_Config.ini` (`show_advanced_item_descriptions`) the
   way upstream's `main/src/host-files/GameConfig.ts` does, so a rebind in-game
   doesn't silently desync the injected combo.
+
+## 9. Per-device XKB layout sync for captured keyboards
+
+`compositor.rs::keyboards()`/`switchxkblayout()` (Stage 5, H2A) — needed because
+grabbing a physical keyboard (§3) takes it out of Hyprland's own input pipeline
+entirely, but its XKB layout state (`us,ru`, `grp:alt_shift_toggle`) is tracked
+*per device* by Hyprland, and `grab.rs::Mirror` (the re-emit target for everything
+capture doesn't consume) is a distinct uinput device with its own independent XKB
+state that starts at index 0 (`us`) the moment it's created. Without syncing the
+two, a device grabbed while the user had toggled to `ru` would have every
+subsequently-typed character silently come out in the wrong layout through the
+mirror, and toggling layout *while* grabbed (typing through the mirror) would leave
+the physical device's own Hyprland-tracked state stale the moment it's ungrabbed.
+
+The fix: on every grab, read the physical device's current `active_layout_index`
+(`hyprctl -j devices`'s `keyboards[]` array) and set the mirror to the same index;
+on every ungrab, read the mirror's current index back and set the physical device
+to match. Both directions go through `switchxkblayout <device-name> <index>` sent
+directly over `.socket.sock` — no `hyprctl` subprocess.
+
+**Two things confirmed empirically on this system (2026-09-24), not assumed:**
+
+- **The device name `switchxkblayout` needs isn't `evdev::Device::name()`'s raw
+  string.** Hyprland reports a mangled version in `hyprctl -j devices`
+  (lowercased, non-alphanumeric runs collapsed to one `-`, trimmed) —
+  `"SteelSeries SteelSeries Apex 7 TKL"` → `"steelseries-steelseries-apex-7-tkl"`,
+  confirmed against this system's actual live device list. `grab.rs::hypr_device_name()`
+  reproduces this transform; there's no vid/pid/phys field in the JSON to join on
+  instead, so name-matching is the only option, with graceful fallback (skip the
+  sync, log it) if a transformed name isn't found.
+- **`hyprctl dispatch switchxkblayout <name> <index>` fails on this system's
+  config**, with a Lua parse error (`hl.dispatch(switchxkblayout ...)`) — this
+  Hyprland config loads a Lua scripting layer (§3's `hl.bind`/`hl.dsp` references
+  are the same layer) that intercepts the `dispatch` socket command and tries to
+  parse its argument as Lua source, which the plain dispatcher-args syntax doesn't
+  satisfy. The **short-form command works**: `switchxkblayout <name> <index>` sent
+  directly (no `dispatch` prefix) — this is what `hyprctl`'s own CLI sends for a
+  handful of common dispatchers, and it bypasses the Lua layer entirely. Verified
+  live: `switchxkblayout steelseries-steelseries-apex-7-tkl 0` returned `ok`, and a
+  follow-up `j/devices` read confirmed `active_layout_index: 0`.
+
+**Known limitation, not implemented**: Caps Lock / Num Lock LED state isn't
+forwarded from the mirror back to the grabbed physical keyboard. `evdev` 0.13.2's
+safe `uinput` builder API has no `with_leds`-style method — only the raw
+`sys::ui_set_ledbit` ioctl exists, unsafe and unwrapped by the crate — so declaring
+`EV_LED` capability on the mirror device would need an `unsafe` call this codebase
+doesn't otherwise need anywhere. Deferred rather than reached for `unsafe` for a
+cosmetic indicator; the caps/num-lock *state* itself (tracked per device by
+Hyprland regardless of the LED light) isn't affected, only the physical light.

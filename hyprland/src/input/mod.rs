@@ -3,6 +3,7 @@
 //!
 //! Stage 2 (see PLAN.md).
 
+mod grab;
 pub mod hotkeys;
 pub mod inject;
 pub mod keymap;

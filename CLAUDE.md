@@ -118,8 +118,9 @@ to catch up on — check it first on every sync from upstream.
 
 See `PLAN.md` for the full module breakdown and the crate versions each depends on.
 In short: `compositor.rs` (Hyprland's `.socket.sock`/`.socket2.sock` IPC, no `hyprctl`
-subprocess spawns), `input/` (evdev listen + uinput inject — hotkeys are **read, never
-grabbed**, so nothing here ever writes to a Hyprland keybind config), `clipboard.rs`
+subprocess spawns), `input/` (evdev listen + `EVIOCGRAB` capture + uinput inject/mirror
+— see `input/hotkeys.rs`/`input/grab.rs`; nothing here ever writes to a Hyprland
+keybind config, which is the actual rule, not whether a device gets grabbed), `clipboard.rs`
 (`wlr-data-control`, event-driven), `overlay/` (GTK4 + `gtk4-layer-shell` +
 WebKit6 — layer-shell surfaces sit outside the compositor's window/focus model
 entirely, which is *why* Electron doesn't work here), `server.rs`/`proxy.rs`
@@ -127,12 +128,22 @@ entirely, which is *why* Electron doesn't work here), `server.rs`/`proxy.rs`
 
 ### Key design decisions worth knowing before changing platform-layer code
 
-- **No Hyprland config is ever touched** — no binds, no window rules, no keywords.
-  This is a hard requirement carried over from a prior prototype whose config-bind
-  approach broke the same key combos in other applications system-wide.
-- **Hotkeys are read via evdev, not intercepted** (`EVIOCGRAB` is never used). The game
-  sees every keypress normally; this only works because the bound combos aren't
-  assigned to anything inside PoE2 itself.
+- **No Hyprland config is ever touched** — no binds, no window rules, no keywords,
+  no `hyprctl keyword`/`eval`. This is the actual hard requirement, carried over
+  from a prior prototype whose config-bind approach broke the same key combos in
+  other applications system-wide. **It is a rule about the compositor's config, not
+  about evdev** — earlier revisions of this file conflated the two by also banning
+  `EVIOCGRAB`, which was a misreading of the actual constraint corrected 2026-09-24.
+- **Physical keyboards ARE grabbed via `EVIOCGRAB`, deliberately, keyd-style** —
+  see `input/hotkeys.rs`/`input/grab.rs`. Grabbing is scoped to real hardware only
+  (never our own `uinput` devices), active only while the game is focused, and a
+  grab/ungrab transition only happens at a moment nothing is held on that specific
+  device (otherwise deferred to its next release) — this is what stops a modifier
+  from being reported stuck to Hyprland. Whatever a grabbed device produces that
+  isn't the matched hotkey's own trigger-key edge is re-emitted immediately through
+  a second, separate `uinput` mirror device, so the game still receives every other
+  key normally. No timers anywhere in this path — `EVIOCGRAB` is fd-scoped kernel
+  state the kernel releases on any process exit, including `SIGKILL`.
 - **Key injection goes through our own `uinput` virtual device**, advertising a
   US-only layout — this sidesteps the user's `us,ru` layout-switching setup entirely,
   since layout switching in Hyprland is per-physical-device. XTEST and
