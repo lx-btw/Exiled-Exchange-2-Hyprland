@@ -33,9 +33,12 @@ webkit6 = "0.6"
 # hotkeys.rs doesn't block the runtime the axum server and GTK share).
 evdev = { version = "0.13", features = ["tokio"] }
 
-# clipboard: wlr-data-control-unstable-v1, event-driven (see clipboard.rs)
+# clipboard: wlr-data-control-unstable-v1, event-driven (see clipboard.rs).
+# wayland-protocols-wlr's `client` feature is what actually generates the
+# data-control bindings (and pulls in wayland-client itself) — without it
+# the crate compiles but exposes nothing.
 wayland-client = "0.31"
-wayland-protocols-wlr = "0.3"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 # tray icon (replaces AppTray.ts)
 ksni = "0.3"
