@@ -18,7 +18,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch, Mutex as TokioMutex};
@@ -31,24 +31,6 @@ use crate::input::hotkeys::Bindings;
 use crate::input::inject::VirtualKeyboard;
 use crate::input::keymap::{self, Modifier, Shortcut};
 use crate::overlay;
-
-/// How long after switching to interactive mode an incoming `focus-game`
-/// event is ignored — ported verbatim from the prior prototype's
-/// `EE2_FOCUS_GRACE` (default 600ms): the renderer was observed sending a
-/// burst of `focus-game` events ~18ms after interactive mode enables, with
-/// no corresponding mouse event on the page (cause never fully identified
-/// upstream either, see HYPRLAND-NOTES.md §8).
-///
-/// **Resolved, Stage 5**: `render-state` does *not* replace this — read
-/// `OverlayWindow.vue`'s actual source rather than continuing to guess.
-/// `render-state`'s `shouldShow` payload is `isOverlayVisible`, a completely
-/// different signal: "does any widget currently have visible content" (used
-/// by `set_visible` below). `focus-game` is sent by `handleBackgroundClick`/
-/// `closePriceCheck` — explicit "user wants focus back on the game" actions
-/// (background click, closing a widget). The two are unrelated; nothing
-/// about `render-state` bears on why the renderer's `focus-game` burst
-/// happens right after activation. This grace window stays.
-const FOCUS_GAME_GRACE: Duration = Duration::from_millis(600);
 
 /// How long to wait for the clipboard to show item text after injecting the
 /// copy combo — matches `host.mjs::copyItemText`'s `timeoutMs`.
@@ -308,7 +290,6 @@ pub struct Overlay {
     /// know "is the overlay currently interactive" independent of whether
     /// this specific keypress happens to match a configured hotkey.
     overlay_interactive_tx: watch::Sender<bool>,
-    interactive_since: Instant,
     /// Ports upstream's `OverlayWindow.wasUsedRecently` (default `true`),
     /// updated from `CLIENT->MAIN::used-recently`'s `isOverlay` field —
     /// `run_copy_item` only auto-focuses the overlay on a `focusOverlay`
@@ -380,7 +361,6 @@ impl Overlay {
             hotkeys_active: hotkeys_active_tx,
             overlay_interactive: false,
             overlay_interactive_tx,
-            interactive_since: Instant::now(),
             used_recently: true,
             area_tracker: None,
             stash_scroll_enabled: false,
@@ -490,9 +470,6 @@ impl Overlay {
             return;
         }
         self.overlay_interactive = interactive;
-        if interactive {
-            self.interactive_since = Instant::now();
-        }
         set_passthrough_on_main_thread(!interactive);
         let _ = self.overlay_interactive_tx.send(interactive);
         // A layer surface isn't a window and never appears in `activewindow`
@@ -845,37 +822,29 @@ impl Overlay {
                 }
             }
             "OVERLAY->MAIN::focus-game" => {
-                // The renderer sends a burst of these right after activation
-                // (see FOCUS_GAME_GRACE docs) — ignore that burst, otherwise
-                // the overlay flips straight back to passthrough before the
-                // user can interact with what they just triggered it for.
-                let age = self.interactive_since.elapsed();
-                let in_grace = self.overlay_interactive && age < FOCUS_GAME_GRACE;
-                // Diagnostic only (Phase C, PLAN.md) — measures whether the
-                // grace window is still earning its keep now that H2B no
-                // longer flips keyboard mode on every activation. Logs
-                // unconditionally (cheap, low-volume: this event only fires
-                // on real user/renderer actions); `EE2_DIAG_NO_FOCUS_GRACE`
-                // additionally *disables* the suppression below so a live
-                // session can show whether an unsolicited focus-game still
-                // arrives and gets acted on without the window catching it.
-                let diag_disabled = std::env::var_os("EE2_DIAG_NO_FOCUS_GRACE").is_some();
-                eprintln!(
-                    "ee2-hyprland: focus-game received (overlay_interactive={}, age_ms={}, in_grace={in_grace}, diag_disabled={diag_disabled})",
-                    self.overlay_interactive,
-                    age.as_millis(),
-                );
-                if in_grace && !diag_disabled {
-                    return;
-                }
+                // Sent by `OverlayWindow.vue`'s `handleBackgroundClick`/
+                // `PriceCheckWindow.vue`'s `closePriceCheck` — explicit
+                // "user wants focus back on the game" actions (background
+                // click, closing a widget). Used to be guarded by a
+                // `FOCUS_GAME_GRACE` window (removed, Phase C, PLAN.md):
+                // ported verbatim from the prior prototype on the
+                // assumption that this fork would see the same
+                // post-activation `focus-game` burst that prototype did.
+                // Live-measured across all three activation paths
+                // (`toggle-overlay`, `Ctrl+Alt+D`, `Ctrl+D`+hover) with the
+                // grace disabled and every receipt logged — the burst never
+                // reproduced here, so there was nothing left for the grace
+                // to guard against.
                 self.set_interactive(false);
             }
             "OVERLAY->MAIN::render-state" => {
                 // `shouldShow` = `OverlayWindow.vue`'s `isOverlayVisible` —
-                // unrelated to interactive/passthrough (see FOCUS_GAME_GRACE
-                // docs). Hides the layer surface entirely when nothing has
-                // visible content, which also happens to mask the
-                // still-open Stage 1 WebView-transparency issue while idle.
+                // a different signal from `focus-game` above (see that
+                // arm's docs): "does any widget currently have visible
+                // content", not "user wants focus back". Hides the layer
+                // surface entirely when nothing has visible content, which
+                // also happens to mask the still-open Stage 1
+                // WebView-transparency issue while idle.
                 let should_show = payload
                     .get("shouldShow")
                     .and_then(Value::as_bool)

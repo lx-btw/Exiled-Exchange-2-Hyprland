@@ -236,20 +236,26 @@ same commands `hyprctl` itself sends) and `.socket2.sock` (a plain event stream 
 `activewindow>>class,title` and friends, newline-delimited) over unix sockets. Same
 data, same semantics, zero subprocess spawns per keypress.
 
-## 8. Known open questions (not yet resolved — see `PLAN.md` Stage 5)
+## 8. Formerly-open questions, both resolved (kept for history)
 
-- **`OVERLAY->MAIN::render-state {shouldShow}`**: upstream added this IPC event
-  after the prior prototype was built; that prototype only logged it without
-  handling it. It's presumably a more precise overlay show/hide signal than the
-  `focus-game`-burst-plus-grace-window heuristic the old code used
-  (`EE2_FOCUS_GRACE`, default 600ms — the renderer was observed sending a burst of
-  `focus-game` events ~18ms after interactive mode enabled, with no corresponding
-  mouse event on the page, cause never fully identified). Needs a running renderer
-  to observe what actually drives it before it can replace anything.
-- **`showModsKey`**: hardcoded as `Alt` in the prior prototype. Should be read from
-  the user's `poe2_production_Config.ini` (`show_advanced_item_descriptions`) the
-  way upstream's `main/src/host-files/GameConfig.ts` does, so a rebind in-game
-  doesn't silently desync the injected combo.
+- **`OVERLAY->MAIN::render-state {shouldShow}`** vs. the prior prototype's
+  `EE2_FOCUS_GRACE` (600ms grace window guarding a `focus-game` burst the
+  prototype observed ~18ms after interactive mode enabled): **resolved,
+  Stage 5** — the two are unrelated signals (`render-state` is "does any
+  widget have visible content", `focus-game` is "user wants focus back"),
+  and reading `OverlayWindow.vue`'s actual source rather than guessing
+  confirmed neither event bears on the other. The grace window itself was
+  then live-measured (Phase C, PLAN.md, 2026-09-25) across all three
+  activation paths (`toggle-overlay`, `Ctrl+Alt+D`, `Ctrl+D`+hover) with the
+  suppression disabled and every `focus-game` receipt logged — the burst
+  the prior prototype saw never reproduced in this fork at all, so
+  `EE2_FOCUS_GRACE`'s Rust equivalent (`FOCUS_GAME_GRACE`) was removed
+  outright, not just left disabled.
+- **`showModsKey`**: was hardcoded as `Alt` in the prior prototype.
+  Resolved, Stage 5 — now read from the user's real
+  `poe2_production_Config.ini` (`show_advanced_item_descriptions`),
+  matching upstream's `main/src/host-files/GameConfig.ts`; see PLAN.md's
+  Stage 5 entry for the live verification against a real config file.
 
 ## 9. Per-device XKB layout sync for captured keyboards
 
