@@ -33,11 +33,22 @@ use tokio::sync::mpsc;
 /// recovery short of killing the process.
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Steam App ID for Path of Exile 2 — the window `class` Hyprland reports
-/// for it. Overridable for testing against a stand-in window, same escape
-/// hatch the prior prototype's `host.mjs` had (`EE2_GAME_CLASS`).
+/// The window `class` Hyprland reports for Path of Exile 2. Corrected live
+/// (2026-09-24, Stage 5): the original guess, `steam_app_2694490` (the
+/// Steam App ID, guessed by analogy with Steam's native-Linux class-naming
+/// convention), does not match this system's actual class — confirmed via
+/// `hyprctl clients -j` against a real running instance
+/// (Steam+Proton, `PROTON_ENABLE_WAYLAND=1`, native Wayland client, not
+/// Xwayland) reporting class `pathofexilesteam.exe`, i.e. Proton's own
+/// `basename.exe`-style naming, not Steam's `steam_app_<id>` wrapper class.
+/// `find_game` returned nothing against the old default on a real game
+/// window every single time, silently — see `EE2_GAME_CLASS`'s own escape
+/// hatch below, which is how this was diagnosed without a rebuild-per-guess
+/// cycle. Overridable for other installs/launch methods, or for testing
+/// against a stand-in window — same escape hatch the prior prototype's
+/// `host.mjs` had.
 pub fn game_class() -> String {
-    std::env::var("EE2_GAME_CLASS").unwrap_or_else(|_| "steam_app_2694490".to_string())
+    std::env::var("EE2_GAME_CLASS").unwrap_or_else(|_| "pathofexilesteam.exe".to_string())
 }
 
 fn socket_dir() -> Option<PathBuf> {

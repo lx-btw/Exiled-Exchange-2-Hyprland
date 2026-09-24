@@ -31,6 +31,7 @@
 
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use evdev::{Device, EventSummary, KeyCode};
@@ -78,7 +79,16 @@ fn open_keyboards() -> Vec<Device> {
 /// keyboard device errors out or is unplugged (this doesn't watch for
 /// hotplugged devices — see module docs' fallback note if that turns out to
 /// matter in practice).
-pub async fn watch(bindings: Bindings, tx: mpsc::UnboundedSender<usize>) {
+///
+/// `game_active` (`state.rs`'s `hotkeys_active`, updated from
+/// `set_game_active`) gates matching: ports upstream's `Shortcuts.ts`
+/// `poeWindow.on("active-change", ...)` → `register()`/`unregister()`, so
+/// a shortcut like `Shift + Space` only fires while PoE2 is the focused
+/// window, not from every other application too. Modifier/held-key
+/// bookkeeping still runs regardless of this flag — only the match-and-fire
+/// step is skipped — so state stays accurate for whenever the game becomes
+/// active again, instead of going stale while it's not.
+pub async fn watch(bindings: Bindings, game_active: Arc<AtomicBool>, tx: mpsc::UnboundedSender<usize>) {
     let devices = open_keyboards();
     if devices.is_empty() {
         eprintln!("ee2-hyprland: no keyboard-like /dev/input device found — hotkeys disabled");
@@ -148,6 +158,10 @@ pub async fn watch(bindings: Bindings, tx: mpsc::UnboundedSender<usize>) {
             // carries no new information for shortcut matching; ignore it.
             1 => {
                 held.insert((fd, code));
+
+                if !game_active.load(Ordering::Relaxed) {
+                    continue;
+                }
 
                 let ctrl = is_held(&held, Modifier::Ctrl.keycodes());
                 let shift = is_held(&held, Modifier::Shift.keycodes());

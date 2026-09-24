@@ -30,6 +30,23 @@ use webkit6::WebView;
 /// Builds the layer-shell overlay window and mounts `webview` inside it.
 /// Starts in passthrough mode — nothing steals input until something (a
 /// hotkey, Stage 2+) switches it to interactive.
+///
+/// **The Stage 1 WebView-transparency bug is still open** (see PLAN.md): an
+/// interactive/visible overlay currently paints an opaque backdrop instead
+/// of showing the desktop/game through it. A `STYLE_PROVIDER_PRIORITY_USER`
+/// CSS provider forcing `window { background-color: transparent }` here
+/// (paired with a `webview.rs` user stylesheet forcing the *page's* own
+/// `html`/`body` transparent, working around a system GTK4 theme's opaque
+/// `.background` rule that otherwise wins the cascade) was tried and
+/// reverted during Stage 5 (2026-09-24): it didn't fix the transparency,
+/// and combined with going through this exact code path, hotkey-triggered
+/// `KeyboardMode::Exclusive` stopped reliably capturing input — pressing
+/// the trigger combo no longer reliably prevented the game from also
+/// seeing the keypress. Root cause not confirmed (the leading theory was a
+/// startup-hidden/not-yet-mapped surface race with the CSS change compounding
+/// it, but a targeted ordering fix in `state.rs` didn't resolve it either).
+/// Revisit as its own isolated change, verified against actual keyboard
+/// capture as well as visuals, not bundled with anything else.
 pub fn build(app: &gtk4::Application, webview: &WebView) -> gtk4::ApplicationWindow {
     let window = gtk4::ApplicationWindow::builder()
         .application(app)

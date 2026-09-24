@@ -16,6 +16,7 @@
 //! Stage 4 (see PLAN.md).
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -70,6 +71,25 @@ fn set_passthrough_on_main_thread(passthrough: bool) {
     gtk4::glib::MainContext::default().invoke(move || {
         WINDOW.with(|w| {
             if let Some(window) = w.borrow().as_ref() {
+                // Becoming interactive (passthrough=false) shows the window
+                // *first*, in this same GTK-thread callback, before setting
+                // `KeyboardMode::Exclusive` — found live (2026-09-24), once
+                // `main.rs` started the surface hidden by default at
+                // startup: `set_keyboard_mode`/`set_input_region` applied to
+                // a not-yet-mapped layer surface silently didn't take
+                // effect, so the overlay opened with no visible content
+                // *and* without ever actually capturing keyboard input —
+                // hotkey presses (Ctrl+D, Shift+Space) leaked straight
+                // through to the game underneath (character moved/rolled)
+                // exactly as if nothing were listening. Waiting on the
+                // renderer's own independent `render-state` event to show
+                // the window instead arrives too late for this: it's a full
+                // WS round-trip that can only complete *after* this
+                // function has already run and already (silently) failed to
+                // grab the keyboard.
+                if !passthrough {
+                    overlay::window::set_visible(window, true);
+                }
                 overlay::window::set_passthrough(window, passthrough);
             }
         });
@@ -168,6 +188,7 @@ fn parse_bindings(shortcuts: &[Value]) -> Vec<Binding> {
                 }
             };
 
+            eprintln!("ee2-hyprland: accepted shortcut \"{shortcut_str}\" -> {action_type}");
             Some(Binding { shortcut, action })
         })
         .collect()
@@ -196,6 +217,17 @@ pub struct Overlay {
     hotkey_bindings: Bindings,
     events_tx: broadcast::Sender<Value>,
     game_active: bool,
+    /// Mirrors `game_active`, but as an `Arc<AtomicBool>` `hotkeys.rs::watch()`
+    /// reads on every keydown to decide whether to even attempt matching —
+    /// ports upstream's `Shortcuts.ts`: `poeWindow.on("active-change", ...)`
+    /// calls `globalShortcut` `register()`/`unregister()`, so hotkeys only
+    /// fire while PoE2 is the focused window. This fork's evdev listener has
+    /// no equivalent "unregister" (it never grabs anything, see hotkeys.rs's
+    /// own docs), so the gate has to be a flag it checks instead. Found
+    /// missing live (2026-09-24): without it, e.g. `Shift + Space` toggled
+    /// the overlay from *any* focused window, not just the game — a real
+    /// behavioral gap from upstream, not a hypothetical.
+    hotkeys_active: Arc<AtomicBool>,
     overlay_interactive: bool,
     interactive_since: Instant,
     /// A weak handle back to the `Arc<TokioMutex<Overlay>>` this instance
@@ -217,14 +249,15 @@ pub struct Overlay {
 impl Overlay {
     /// `events_tx` is shared with `server.rs`, which subscribes a fresh
     /// receiver per WS connection. Returns the constructed state plus the
-    /// `Bindings` handle `hotkeys::watch()` needs — created here (empty)
-    /// rather than in `main.rs`, since `update_host_config` is what
-    /// actually populates it and that only makes sense as an `Overlay`
-    /// method.
-    pub fn new(events_tx: broadcast::Sender<Value>) -> std::io::Result<(Self, Bindings)> {
+    /// `Bindings` handle and the `hotkeys_active` flag `hotkeys::watch()`
+    /// needs — created here (empty/false) rather than in `main.rs`, since
+    /// `update_host_config`/`set_game_active` are what actually populate
+    /// them and that only makes sense as `Overlay` methods.
+    pub fn new(events_tx: broadcast::Sender<Value>) -> std::io::Result<(Self, Bindings, Arc<AtomicBool>)> {
         let keyboard = VirtualKeyboard::new()?;
         let clipboard_rx = clipboard::spawn()?;
         let hotkey_bindings: Bindings = Arc::new(StdMutex::new(Vec::new()));
+        let hotkeys_active = Arc::new(AtomicBool::new(false));
 
         let overlay = Self {
             config_store: ConfigStore::new(),
@@ -238,11 +271,12 @@ impl Overlay {
             hotkey_bindings: hotkey_bindings.clone(),
             events_tx,
             game_active: false,
+            hotkeys_active: hotkeys_active.clone(),
             overlay_interactive: false,
             interactive_since: Instant::now(),
             self_ref: Weak::new(),
         };
-        Ok((overlay, hotkey_bindings))
+        Ok((overlay, hotkey_bindings, hotkeys_active))
     }
 
     /// See `self_ref`'s docs — must be called once, right after `Overlay` is
@@ -298,6 +332,7 @@ impl Overlay {
             return;
         }
         self.game_active = active;
+        self.hotkeys_active.store(active, Ordering::Relaxed);
         self.send_focus_change(false);
     }
 
@@ -431,6 +466,10 @@ impl Overlay {
             return;
         };
         let (x, y) = position.unwrap_or((0, 0));
+        eprintln!(
+            "ee2-hyprland: copy-item: success, {} chars at ({x},{y}), broadcasting item-text",
+            text.len()
+        );
 
         let mut guard = overlay.lock().await;
         guard.broadcast(json!({
@@ -606,6 +645,7 @@ impl Overlay {
                     .get("shouldShow")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
+                eprintln!("ee2-hyprland: render-state shouldShow={should_show}");
                 set_visible_on_main_thread(should_show);
             }
             "CLIENT->MAIN::used-recently"

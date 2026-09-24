@@ -39,7 +39,7 @@ fn main() -> gtk4::glib::ExitCode {
         rt.block_on(async {
             let (events_tx, _events_rx) = broadcast::channel(32);
 
-            let (overlay, hotkey_bindings) = match state::Overlay::new(events_tx.clone()) {
+            let (overlay, hotkey_bindings, hotkeys_active) = match state::Overlay::new(events_tx.clone()) {
                 Ok(result) => result,
                 Err(err) => {
                     eprintln!("ee2-hyprland: failed to initialize overlay state: {err}");
@@ -89,12 +89,14 @@ fn main() -> gtk4::glib::ExitCode {
             // keep `Overlay::new()` (or anything else that constructs a
             // `VirtualKeyboard`) strictly before this line.
             let (hotkey_tx, mut hotkey_rx) = mpsc::unbounded_channel();
-            tokio::spawn(input::hotkeys::watch(hotkey_bindings, hotkey_tx));
+            tokio::spawn(input::hotkeys::watch(hotkey_bindings, hotkeys_active, hotkey_tx));
             {
                 let overlay = overlay.clone();
                 tokio::spawn(async move {
                     while let Some(index) = hotkey_rx.recv().await {
+                        eprintln!("ee2-hyprland: dispatching hotkey index {index}");
                         state::Overlay::on_hotkey_fired(&overlay, index).await;
+                        eprintln!("ee2-hyprland: hotkey index {index} dispatch complete");
                     }
                 });
             }
@@ -154,6 +156,23 @@ fn main() -> gtk4::glib::ExitCode {
         let window = overlay::window::build(app, &webview);
         state::register_window(window.clone());
         window.present();
+        // Start hidden — `present()` above only exists to force `realize`
+        // (so `window.rs`'s `connect_realize` sets up passthrough input
+        // region + `KeyboardMode::None` right away). The surface only
+        // becomes visible on the renderer's own first `render-state`
+        // event (`state.rs::handle_ws_event`) or an interactive action.
+        //
+        // Without this, a renderer that fails to mount for *any* reason —
+        // a network hiccup, a proxy env var intercepting our own loopback
+        // asset requests (a real, previously-flagged risk: see PLAN.md
+        // Stage 1's `NO_PROXY` note), a crash — leaves this surface
+        // sitting fully visible with nothing to hide it, and the still-
+        // open Stage 1 WebView-transparency bug means that's an opaque
+        // backdrop covering the entire screen, indefinitely, with no
+        // visual way to tell what's clickable underneath. This happened
+        // for real during Stage 5 manual testing (2026-09-24) and forced
+        // a blind logout — see PLAN.md's Stage 5 entry.
+        window.set_visible(false);
     });
 
     app.run_with_args::<&str>(&[])
