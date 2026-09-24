@@ -98,6 +98,18 @@
 //!                                  always passthrough/None, matching
 //!                                  `main.rs`'s real startup, regardless of
 //!                                  that flag).
+//!   EE2_LAB_HWACCEL=never          (webkit only) calls this WebView's own
+//!                                  `settings.set_hardware_acceleration_policy
+//!                                  (HardwareAccelerationPolicy::Never)`
+//!                                  instead of setting the process-wide
+//!                                  `WEBKIT_DISABLE_COMPOSITING_MODE=1` env
+//!                                  var — G1 (PLAN.md) A/B test of whether
+//!                                  the documented per-`WebView` API
+//!                                  reproduces the same storm fix as the env
+//!                                  var. Combine with
+//!                                  `EE2_LAB_STORM_REPRO=show_only` to
+//!                                  compare directly against the env-var
+//!                                  fix's own trace.
 //!
 //! Every mode draws a semi-transparent magenta marker box in the corner
 //! (rgba, 40% alpha) as a position/blend sanity check distinct from the
@@ -126,9 +138,10 @@ fn main() -> gtk4::glib::ExitCode {
     let color_scheme = env_flag("EE2_LAB_COLOR_SCHEME");
     let bg_magenta = std::env::var("EE2_LAB_BG").as_deref() == Ok("magenta");
     let storm_repro = std::env::var("EE2_LAB_STORM_REPRO").ok();
+    let hwaccel = std::env::var("EE2_LAB_HWACCEL").ok();
 
     eprintln!(
-        "transparency-lab: engine={engine} css={apply_css} style={apply_style} color_scheme={color_scheme} bg_magenta={bg_magenta}"
+        "transparency-lab: engine={engine} css={apply_css} style={apply_style} color_scheme={color_scheme} bg_magenta={bg_magenta} storm_repro={storm_repro:?} hwaccel={hwaccel:?}"
     );
 
     let app = gtk4::Application::builder()
@@ -371,6 +384,12 @@ fn build_webkit_mode(
     use webkit6::WebView;
 
     let webview = WebView::new();
+
+    if std::env::var("EE2_LAB_HWACCEL").as_deref() == Ok("never") {
+        if let Some(settings) = WebViewExt::settings(&webview) {
+            settings.set_hardware_acceleration_policy(webkit6::HardwareAccelerationPolicy::Never);
+        }
+    }
 
     let bg = if bg_magenta {
         gtk4::gdk::RGBA::new(1.0, 0.0, 1.0, 1.0)

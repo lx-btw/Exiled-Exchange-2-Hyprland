@@ -11,7 +11,7 @@
 
 use gtk4::gdk;
 use webkit6::prelude::*;
-use webkit6::WebView;
+use webkit6::{HardwareAccelerationPolicy, WebView};
 
 const ELECTRON_UA_SUBSTRING: &str = "Electron/44.0.0";
 
@@ -31,6 +31,21 @@ const ELECTRON_UA_SUBSTRING: &str = "Electron/44.0.0";
 /// 2026-09-24) reproducibly broke `KeyboardMode::Exclusive` (hotkeys stopped
 /// reliably capturing input) through an unconfirmed mechanism — the
 /// window-level fix doesn't need it, so don't reintroduce it.
+///
+/// **Render-storm fix, now via per-`WebView` API instead of a process-wide
+/// env var** (PLAN.md, "Storm mechanism" / Session 7 / G1): originally
+/// `WEBKIT_DISABLE_COMPOSITING_MODE=1` set as a process env var in
+/// `main.rs`, before any WebKit object existed. Verified in G1
+/// (`hyprland/diag/G1_*`, both the lab's `EE2_LAB_HWACCEL=never` mode and
+/// the real binary's tray-toggle cycle) that
+/// `settings.set_hardware_acceleration_policy(Never)` reproduces the exact
+/// same fix — WebKit falls through its non-accelerated rendering path,
+/// which re-attaches a real buffer through the window's own surface on
+/// every hide/show cycle instead of getting stuck after
+/// gtk4-layer-shell recreates the surface's `zwlr_layer_surface_v1` role.
+/// This is the documented, per-object way to ask for the same thing
+/// `WEBKIT_DISABLE_COMPOSITING_MODE` does process-wide, so it replaces the
+/// `unsafe std::env::set_var` call that used to live in `main.rs`.
 pub fn build(url: &str) -> WebView {
     let webview = WebView::new();
 
@@ -41,6 +56,7 @@ pub fn build(url: &str) -> WebView {
     // Stage 1's "renderer loads without console errors" check is verified
     // through this — renderer console.log/warn/error land on our stdout.
     settings.set_enable_write_console_messages_to_stdout(true);
+    settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
 
     webview.set_background_color(&gdk::RGBA::TRANSPARENT);
     webview.load_uri(url);
