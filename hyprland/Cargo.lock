@@ -470,6 +470,7 @@ dependencies = [
  "ksni",
  "reqwest",
  "rust-embed",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

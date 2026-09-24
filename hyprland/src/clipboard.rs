@@ -33,12 +33,14 @@
 //! after clearing the selection (known to work, just slower) — keep this
 //! module's public interface unchanged either way.
 
+use std::collections::VecDeque;
 use std::io;
-use std::os::fd::AsFd;
-use std::sync::Mutex;
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use rustix::event::{poll, PollFd, PollFlags};
+use tokio::sync::{mpsc, oneshot};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
@@ -47,6 +49,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1, EVT_DATA_OFFER_OPCODE},
     zwlr_data_control_manager_v1::{self, ZwlrDataControlManagerV1},
     zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
+    zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 
 /// How long `receive()` waits for a source client to finish writing an
@@ -312,6 +315,13 @@ fn receive(
 /// that doesn't fit tokio without a custom event source — a dedicated
 /// thread is simpler, and there's exactly one of these for the whole
 /// process's lifetime.
+///
+/// Also starts the write-side counterpart (`run_writer`, its own connection
+/// and thread — see that function's docs for why it's separate from the
+/// read loop above) and publishes its job queue into `WRITE_QUEUE` for
+/// `write_text` to reach. Both are one-time, process-lifetime setup, so
+/// `Overlay::new` (the sole caller) doing both here rather than exposing a
+/// second `spawn`-like entry point keeps that call site simple.
 pub fn spawn() -> io::Result<mpsc::UnboundedReceiver<ClipboardEvent>> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
@@ -321,7 +331,253 @@ pub fn spawn() -> io::Result<mpsc::UnboundedReceiver<ClipboardEvent>> {
                 eprintln!("ee2-hyprland: clipboard watcher exited: {err}");
             }
         })?;
+
+    let wake = rustix::event::eventfd(0, rustix::event::EventfdFlags::empty())?;
+    let queue = Arc::new(WriteQueue {
+        jobs: Mutex::new(VecDeque::new()),
+        wake,
+    });
+    let writer_queue = queue.clone();
+    std::thread::Builder::new()
+        .name("ee2-hyprland-clipboard-write".into())
+        .spawn(move || {
+            if let Err(err) = run_writer(writer_queue) {
+                eprintln!("ee2-hyprland: clipboard writer exited: {err}");
+            }
+        })?;
+    // Only fails if called twice — `spawn()` itself is documented
+    // single-call, so a failure here would mean a caller bug, not a
+    // runtime condition worth propagating as an `io::Error`.
+    let _ = WRITE_QUEUE.set(queue);
+
     Ok(rx)
+}
+
+/// A pending `write_text` call's payload, queued for `run_writer`'s thread
+/// to pick up and turn into a real `zwlr_data_control_source_v1`.
+struct WriteJob {
+    text: String,
+    done: oneshot::Sender<io::Result<()>>,
+}
+
+/// The channel between `write_text` (called from tokio tasks) and
+/// `run_writer`'s thread (blocked in `poll`, not on an async runtime).
+/// `wake` is an `eventfd`: `write_text` bumps its counter after pushing a
+/// job, which is what wakes `run_writer` out of `poll` without a timer —
+/// same role a self-pipe would play, minus the pipe's two-fd bookkeeping.
+struct WriteQueue {
+    jobs: Mutex<VecDeque<WriteJob>>,
+    wake: OwnedFd,
+}
+
+/// Set once, by `spawn()`, before any real `write_text` call can happen
+/// (`Overlay::new` constructs the clipboard before anything else that could
+/// race it) — `write_text` treats an unset queue as a caller-ordering bug,
+/// not a transient condition to retry.
+static WRITE_QUEUE: OnceLock<Arc<WriteQueue>> = OnceLock::new();
+
+/// Dispatch target for `run_writer`'s own connection — deliberately separate
+/// from `State` (the read loop's dispatch target) even though the
+/// registry/seat/manager handling is identical: keeping the two connections
+/// and their `Dispatch` impls independent means neither loop's state or
+/// timing assumptions leak into the other.
+struct WriterState;
+
+impl Dispatch<WlRegistry, GlobalListContents> for WriterState {
+    fn event(
+        _: &mut Self,
+        _: &WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<WlSeat, ()> for WriterState {
+    fn event(
+        _: &mut Self,
+        _: &WlSeat,
+        _: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrDataControlManagerV1, ()> for WriterState {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrDataControlManagerV1,
+        _: zwlr_data_control_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwlrDataControlDeviceV1, ()> for WriterState {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrDataControlDeviceV1,
+        event: zwlr_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // We only ever create this device to call `set_selection` on it —
+        // reading back `data_offer`/`selection`/`primary_selection` is the
+        // *read* side's concern (`State`, the other connection). The
+        // compositor still creates an offer object on `DataOffer` for every
+        // selection change (including our own writes) — destroyed
+        // immediately, right here, rather than left to leak for the
+        // connection's whole lifetime. `Selection`/`PrimarySelection`
+        // reference that *same* already-destroyed id, not a new one, so
+        // there's nothing left to do when those arrive.
+        if let zwlr_data_control_device_v1::Event::DataOffer { id } = event {
+            id.destroy();
+        }
+    }
+
+    event_created_child!(Self, ZwlrDataControlDeviceV1, [
+        EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrDataControlOfferV1, ()> for WriterState {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrDataControlOfferV1,
+        _: zwlr_data_control_offer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Only the `Offer` (mime-type announcement) event ever arrives here
+        // — nothing to do with it on a device we only ever write through.
+    }
+}
+
+/// Each live `ZwlrDataControlSourceV1`'s user-data: the exact text it needs
+/// to hand back on every `Send`, however many times the game asks (a
+/// clipboard manager or the game itself may paste more than once before the
+/// next `write_text` replaces this selection).
+impl Dispatch<ZwlrDataControlSourceV1, Mutex<String>> for WriterState {
+    fn event(
+        _: &mut Self,
+        source: &ZwlrDataControlSourceV1,
+        event: zwlr_data_control_source_v1::Event,
+        text: &Mutex<String>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_data_control_source_v1::Event::Send { fd, .. } => {
+                use std::io::Write;
+                let text = text.lock().unwrap().clone();
+                // Closing `file` (end of scope) drops the fd, which is the
+                // EOF signal the reading side (the game, or `read_x11_selection`'s
+                // Wayland-native counterpart) is waiting for — same
+                // write-then-drop shape `write_text`'s xsel/wl-copy subprocess
+                // path already relied on via stdin.
+                let mut file = std::fs::File::from(fd);
+                if let Err(err) = file.write_all(text.as_bytes()) {
+                    eprintln!("ee2-hyprland: clipboard write: failed to write paste data: {err}");
+                }
+            }
+            zwlr_data_control_source_v1::Event::Cancelled => {
+                // A later `write_text` (or another client's own copy) took
+                // over the selection — this source has no further use.
+                source.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The MIME types every offered source advertises — deliberately the same
+/// three `pick_mime_type`'s `PREFERRED` list favors on the read side, minus
+/// `STRING`/`TEXT` (legacy X11-only names with no real Wayland-native
+/// client asking for them). The bytes handed back on `Send` are identical
+/// regardless of which of these the requester picked — this is plain UTF-8
+/// text, not something that actually varies by encoding label.
+const OFFERED_MIME_TYPES: &[&str] = &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
+
+/// Runs on its own dedicated OS thread and its own Wayland connection,
+/// separate from `run()`'s read loop above — a source has to keep answering
+/// `Send` for as long as it holds the selection (potentially long after the
+/// `write_text` call that created it has already returned), which means
+/// this thread's dispatch loop needs to run indefinitely alongside the read
+/// loop's, not interleaved with it on the same fd/thread.
+///
+/// Multiplexes two fds with a single blocking `poll` (no timer, no polling
+/// interval): the connection's own fd (new events from the compositor —
+/// mainly `Send`/`Cancelled` on whatever source currently holds the
+/// selection) and `queue.wake` (a new job pushed by `write_text`). This is
+/// the standard "external event loop" pattern `wayland-client`'s own docs
+/// describe for `EventQueue::prepare_read`, just with a second fd folded
+/// into the same `poll` call instead of only ever waiting on the
+/// connection.
+fn run_writer(queue: Arc<WriteQueue>) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::connect_to_env()?;
+    let (globals, mut event_queue) = registry_queue_init::<WriterState>(&conn)?;
+    let qh = event_queue.handle();
+
+    let seat: WlSeat = globals.bind(&qh, 1..=1, ())?;
+    let manager: ZwlrDataControlManagerV1 = globals.bind(&qh, 1..=2, ())?;
+    let device = manager.get_data_device(&seat, &qh, ());
+
+    let mut state = WriterState;
+
+    loop {
+        event_queue.dispatch_pending(&mut state)?;
+        conn.flush()?;
+
+        // Handing off queued jobs here (rather than only right after the
+        // wake fd is seen readable) covers the case where a job was pushed
+        // between the loop's last wait and this point — checking
+        // unconditionally on every pass means that race can't drop a job.
+        while let Some(job) = queue.jobs.lock().unwrap().pop_front() {
+            let source = manager.create_data_source(&qh, Mutex::new(job.text));
+            for mime in OFFERED_MIME_TYPES {
+                source.offer(mime.to_string());
+            }
+            device.set_selection(Some(&source));
+            conn.flush()?;
+            // `write_text` only needs to know the selection was handed to
+            // the compositor, not that a paste actually happened yet — same
+            // "fire and let it linger" contract `wl-copy` (without
+            // `--foreground`) has.
+            let _ = job.done.send(Ok(()));
+        }
+
+        let Some(read_guard) = event_queue.prepare_read() else {
+            // Events already queued from the dispatch above — go handle
+            // those (and any newly-queued jobs) before trying to read again.
+            continue;
+        };
+        let conn_fd = read_guard.connection_fd();
+        let mut fds = [
+            PollFd::new(&conn_fd, PollFlags::IN),
+            PollFd::new(&queue.wake, PollFlags::IN),
+        ];
+        poll(&mut fds, None)?;
+
+        if fds[1].revents().contains(PollFlags::IN) {
+            // Drain the eventfd counter — left unread, it stays readable
+            // and `poll` would return immediately forever after.
+            let mut buf = [0u8; 8];
+            let _ = rustix::io::read(&queue.wake, &mut buf);
+        }
+        if fds[0].revents().contains(PollFlags::IN) {
+            let _ = read_guard.read();
+        } else {
+            drop(read_guard);
+        }
+    }
 }
 
 fn run(tx: mpsc::UnboundedSender<ClipboardEvent>) -> Result<(), Box<dyn std::error::Error>> {
@@ -372,44 +628,53 @@ async fn read_x11_selection() -> io::Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Writes `text` to the clipboard the game will actually read from —
-/// `wl-copy` for a native/Wayland-Proton client, `xsel -b -i` (matching
-/// `read_x11_selection`'s own fallback) for Xwayland, gated on the same
-/// `xwayland` flag every other clipboard function here takes. Stash-search
-/// (`state.rs::run_stash_search`) is the only caller: a one-shot,
-/// user-triggered write, not a per-keystroke hot path, so this reaches for
-/// a subprocess rather than a `zwlr_data_control_source_v1` — the same
-/// scope-reduction call already made for the X11 *read* fallback above
-/// (holding a data-control source open long enough for the game to
-/// actually paste, and answering repeated `Send` events until then, is a
-/// real chunk of protocol machinery this doesn't justify).
+/// Writes `text` to the clipboard the game will actually read from,
+/// gated on the same `xwayland` flag every other clipboard function here
+/// takes. Xwayland still goes through the `xsel -b -i` subprocess (matching
+/// `read_x11_selection`'s own fallback) — documented secondary path, kept
+/// deliberately: X11 doesn't have as convenient a source-object primitive
+/// as `zwlr_data_control_source_v1` to build on, and this is the rarer of
+/// the two cases (only reached for a game running under plain Xwayland
+/// without `PROTON_ENABLE_WAYLAND=1`).
+///
+/// The native-Wayland path (Phase C, PLAN.md) no longer shells out to
+/// `wl-copy` — it hands the text to `run_writer`'s thread over
+/// `WRITE_QUEUE`, which creates a real `zwlr_data_control_source_v1` on the
+/// connection it already holds open and answers `Send` itself. Stash-search
+/// (`state.rs::run_stash_search`) is the only caller.
 pub async fn write_text(text: &str, xwayland: bool) -> io::Result<()> {
-    use tokio::io::AsyncWriteExt;
+    if xwayland {
+        use tokio::io::AsyncWriteExt;
 
-    let mut command = if xwayland {
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
-        let mut command = tokio::process::Command::new("xsel");
-        command.args(["-b", "-i"]).env("DISPLAY", display);
-        command
+        let mut child = tokio::process::Command::new("xsel")
+            .args(["-b", "-i"])
+            .env("DISPLAY", display)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin was piped above");
+        stdin.write_all(text.as_bytes()).await?;
+        drop(stdin); // EOF, so the reading end (xsel) can return
+
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(io::Error::other(format!("xsel exited with {status}")));
+        }
+        Ok(())
     } else {
-        tokio::process::Command::new("wl-copy")
-    };
-
-    let mut child = command
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-    let mut stdin = child.stdin.take().expect("stdin was piped above");
-    stdin.write_all(text.as_bytes()).await?;
-    drop(stdin); // EOF, so the reading end (xsel) can return
-
-    let status = child.wait().await?;
-    if !status.success() {
-        let program = if xwayland { "xsel" } else { "wl-copy" };
-        return Err(io::Error::other(format!(
-            "{program} exited with {status}"
-        )));
+        let queue = WRITE_QUEUE.get().ok_or_else(|| {
+            io::Error::other("clipboard writer not started (spawn() not called yet)")
+        })?;
+        let (done_tx, done_rx) = oneshot::channel();
+        queue.jobs.lock().unwrap().push_back(WriteJob {
+            text: text.to_string(),
+            done: done_tx,
+        });
+        rustix::io::write(&queue.wake, &1u64.to_ne_bytes())?;
+        done_rx
+            .await
+            .map_err(|_| io::Error::other("clipboard writer thread exited"))?
     }
-    Ok(())
 }
 
 /// Waits (up to `timeout`) for a clipboard read that looks like item text —
@@ -453,5 +718,67 @@ pub async fn read_item_text(
                 Ok(None) | Err(_) => return None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase C (PLAN.md): `write_text`'s native-Wayland path used to shell
+    /// out to `wl-copy` per call; it now creates its own
+    /// `zwlr_data_control_source_v1` on `run_writer`'s connection. This is
+    /// the round-trip check that replaces "read it back with `wl-paste`
+    /// after a manual `wl-copy`" manual testing — needs a live compositor
+    /// with a seat and `wlr-data-control` support (true of the dev/CI
+    /// Hyprland session this runs on; skips gracefully if `wl-paste`
+    /// itself can't run at all, e.g. no `WAYLAND_DISPLAY`).
+    #[tokio::test]
+    async fn write_text_round_trips_without_a_wl_copy_subprocess() {
+        async fn wl_copy_pids() -> Vec<u8> {
+            // Snapshot before/after, compared for equality below — some
+            // systems already run an unrelated long-lived `wl-copy`
+            // (e.g. a clipboard manager holding the primary selection), so
+            // "zero running" is the wrong assertion; "the set didn't grow"
+            // is what actually proves `write_text` didn't spawn one.
+            tokio::process::Command::new("pgrep")
+                .args(["-x", "wl-copy"])
+                .output()
+                .await
+                .expect("pgrep")
+                .stdout
+        }
+
+        let marker = format!(
+            "ee2-hyprland clipboard.rs test {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let before = wl_copy_pids().await;
+
+        let _rx = spawn().expect("clipboard::spawn");
+        write_text(&marker, /* xwayland */ false)
+            .await
+            .expect("write_text");
+
+        let output = tokio::process::Command::new("wl-paste")
+            .arg("-n")
+            .output()
+            .await
+            .expect("wl-paste");
+        assert!(output.status.success(), "wl-paste failed: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), marker);
+
+        // The whole point of Phase C: no *new* `wl-copy` subprocess exists
+        // to serve this selection — `run_writer`'s own source answered
+        // `wl-paste`'s `Receive` directly.
+        let after = wl_copy_pids().await;
+        assert_eq!(
+            before, after,
+            "a new wl-copy process appeared — write_text should never spawn one"
+        );
     }
 }

@@ -30,7 +30,7 @@ use crate::compositor;
 use crate::input::hotkeys::ModifierState;
 use crate::input::inject::VIRTUAL_KEYBOARD_NAME;
 use crate::input::keymap::Modifier;
-use crate::state::Overlay;
+use crate::state::{self, Overlay};
 
 /// A widget's on-screen rectangle, already converted to Hyprland's global
 /// layout coordinates by the caller (`state.rs`) — see
@@ -103,6 +103,11 @@ enum Kind {
 enum DeviceMsg {
     Motion,
     Click,
+    /// Raw `REL_WHEEL` value (sign is direction, matching upstream's
+    /// `UiohookWheelEvent.rotation` — see `handle_wheel`). `stashScroll`
+    /// (Phase C, PLAN.md): reads the same mouse devices this module already
+    /// opens for hover tracking, so no new device-open logic for it.
+    Wheel(i32),
     Closed,
 }
 
@@ -191,6 +196,80 @@ async fn handle_position(
     }
 }
 
+/// Ports `Shortcuts.ts`'s `isStashArea` 1:1 — the sidebar-width ratio
+/// (`370/600`, `GameWindow.ts::uiSidebarWidth`) and the vertical band
+/// (`154/1600`..`1192/1600`) are its exact literal constants, not
+/// independently derived from anything about this fork's own UI.
+fn is_stash_area(cursor: (f64, f64), at: (i32, i32), size: (i32, i32)) -> bool {
+    let (cx, cy) = cursor;
+    let (bx, by) = (at.0 as f64, at.1 as f64);
+    let bh = size.1 as f64;
+    let sidebar_width = (bh * 370.0 / 600.0).round();
+
+    if cx > bx + sidebar_width {
+        return false;
+    }
+    cy > by + bh * 154.0 / 1600.0 && cy < by + bh * 1192.0 / 1600.0
+}
+
+/// `stashScroll` (Phase C, PLAN.md): ports `Shortcuts.ts`'s `wheel` handler
+/// — `Ctrl` held, the game focused, the feature enabled in config, and the
+/// cursor *outside* the stash grid itself (`is_stash_area`, above) all have
+/// to hold before a wheel notch becomes an `ArrowLeft`/`ArrowRight` tap.
+/// Mirrors upstream's own early-return order (`!e.ctrlKey ||
+/// !this.poeWindow.isActive || !this.stashScroll`) for the cheap checks
+/// first, before paying for the compositor round-trips `is_stash_area`
+/// needs.
+async fn handle_wheel(delta: i32, modifiers: &ModifierState, overlay: &Weak<TokioMutex<Overlay>>) {
+    if delta == 0 || !modifiers.ctrl() {
+        return;
+    }
+
+    let Some(strong) = overlay.upgrade() else {
+        return;
+    };
+    {
+        let guard = strong.lock().await;
+        if !guard.game_active() || !guard.stash_scroll_enabled() {
+            return;
+        }
+    }
+
+    let (clients, cursor) = tokio::join!(compositor::clients(), compositor::cursor_pos());
+    let clients = match clients {
+        Ok(clients) => clients,
+        Err(err) => {
+            eprintln!("ee2-hyprland: stash-scroll: failed to query clients: {err}");
+            return;
+        }
+    };
+    let Some(game) = compositor::find_game(&clients) else {
+        eprintln!(
+            "ee2-hyprland: stash-scroll: game window ({}) not found, ignoring wheel",
+            compositor::game_class()
+        );
+        return;
+    };
+    let (x, y) = match cursor {
+        Ok(pos) => pos,
+        Err(err) => {
+            eprintln!("ee2-hyprland: stash-scroll: cursorpos query failed: {err}");
+            return;
+        }
+    };
+
+    if is_stash_area((x as f64, y as f64), game.at, game.size) {
+        return; // over the stash grid itself — leave the wheel to the game
+    }
+
+    let right = delta > 0;
+    eprintln!(
+        "ee2-hyprland: stash-scroll: Ctrl+wheel outside stash area, tab {}",
+        if right { "right" } else { "left" }
+    );
+    state::inject_stash_scroll_tab(overlay, right).await;
+}
+
 /// Runs until `cmd_rx` closes (process shutdown). Owns every mouse-like
 /// input device found at startup — like `hotkeys::watch`, this doesn't
 /// handle hotplugged devices (see that module's docs for the same
@@ -228,6 +307,11 @@ pub async fn watch(
                                     || axis == RelativeAxisCode::REL_Y =>
                             {
                                 Some(DeviceMsg::Motion)
+                            }
+                            EventSummary::RelativeAxis(_, axis, value)
+                                if axis == RelativeAxisCode::REL_WHEEL =>
+                            {
+                                Some(DeviceMsg::Wheel(value))
                             }
                             EventSummary::Key(_, KeyCode::BTN_LEFT, 1) => Some(DeviceMsg::Click),
                             _ => None,
@@ -275,6 +359,20 @@ pub async fn watch(
                     DeviceMsg::Motion => Kind::Move,
                     DeviceMsg::Click => Kind::Click,
                     DeviceMsg::Closed => continue,
+                    DeviceMsg::Wheel(delta) => {
+                        // Independent of the hover-tracking `session`
+                        // above (`stashScroll` isn't gated on any widget
+                        // being open) — spawned rather than awaited inline
+                        // so a slow compositor round-trip or injection
+                        // doesn't stall this loop's handling of concurrent
+                        // motion/click events.
+                        let modifiers = modifiers.clone();
+                        let overlay = overlay.clone();
+                        tokio::spawn(async move {
+                            handle_wheel(delta, &modifiers, &overlay).await;
+                        });
+                        continue;
+                    }
                 };
                 // Only bother querying the compositor while something is
                 // actually being tracked — otherwise every ordinary mouse
@@ -305,5 +403,40 @@ pub async fn watch(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `at`/`size` are the real numbers `hyprctl clients -j` reported for a
+    // live PoE2 window on this system's `DP-1` (`hyprland/diag/`, Phase C
+    // session) — not synthetic, so this locks in the exact geometry
+    // `is_stash_area` has to reproduce from upstream's `isStashArea`.
+    const AT: (i32, i32) = (0, 155);
+    const SIZE: (i32, i32) = (2560, 1440);
+
+    #[test]
+    fn inside_sidebar_and_vertical_band_is_stash_area() {
+        assert!(is_stash_area((500.0, 600.0), AT, SIZE));
+    }
+
+    #[test]
+    fn past_sidebar_width_is_not_stash_area() {
+        // sidebar_width = round(1440 * 370 / 600) = 888
+        assert!(!is_stash_area((900.0, 600.0), AT, SIZE));
+    }
+
+    #[test]
+    fn above_the_vertical_band_is_not_stash_area() {
+        // band starts at 155 + 1440 * 154 / 1600 = 293.6
+        assert!(!is_stash_area((500.0, 200.0), AT, SIZE));
+    }
+
+    #[test]
+    fn below_the_vertical_band_is_not_stash_area() {
+        // band ends at 155 + 1440 * 1192 / 1600 = 1227.8
+        assert!(!is_stash_area((500.0, 1300.0), AT, SIZE));
     }
 }

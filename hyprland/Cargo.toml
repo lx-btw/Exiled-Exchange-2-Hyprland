@@ -45,6 +45,12 @@ evdev = { version = "0.13", features = ["tokio"] }
 # the crate compiles but exposes nothing.
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# `event` feature only: `poll`+`eventfd`, used by clipboard.rs's writer
+# thread to multiplex "new write job" against the wayland connection's own
+# fd without a timer — already a transitive dep of wayland-client/evdev, so
+# this doesn't add a new library to the tree, just a direct-dependency
+# declaration on parts of one already there.
+rustix = { version = "1", features = ["event"] }
 
 # tray icon (replaces AppTray.ts)
 ksni = "0.3"

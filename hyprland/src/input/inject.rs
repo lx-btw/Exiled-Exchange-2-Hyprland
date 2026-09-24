@@ -153,4 +153,19 @@ impl VirtualKeyboard {
         self.tap(KeyCode::KEY_ENTER).await?;
         Ok(())
     }
+
+    /// `stashScroll` (Phase C, PLAN.md): ports `Shortcuts.ts`'s Ctrl+wheel
+    /// tab-switch — a bare `ArrowRight`/`ArrowLeft` tap, no modifier
+    /// (`Ctrl` is the *trigger* condition `area_tracker.rs` already checked
+    /// before calling this, not part of the injected combo itself, matching
+    /// upstream's own `uIOhook.keyTap(UiohookKey.ArrowRight)` call with no
+    /// modifier argument).
+    pub async fn stash_scroll_tab(&mut self, right: bool) -> io::Result<()> {
+        self.tap(if right {
+            KeyCode::KEY_RIGHT
+        } else {
+            KeyCode::KEY_LEFT
+        })
+        .await
+    }
 }

@@ -322,6 +322,17 @@ pub struct Overlay {
     /// toggle-overlay silently skip starting or stopping a tracking session
     /// rather than panicking.
     area_tracker: Option<area_tracker::Handle>,
+    /// `stashScroll` (Phase C, PLAN.md): `HostConfig.stashScroll`, mirrored
+    /// here the same way `used_recently` mirrors `used-recently` — plain
+    /// polled state rather than a `watch` channel, since `area_tracker.rs`
+    /// already has to `upgrade()`+lock `self_ref`-style to reach `Overlay`
+    /// for every wheel event's `game_active()` check anyway (a compositor
+    /// round-trip dwarfs one extra field read). Default `false`, matching
+    /// upstream's `Shortcuts` class's own field default (`private
+    /// stashScroll = false`) rather than the renderer's saved-config
+    /// default (`true`) — nothing here acts on it until the real
+    /// `update-host-config` arrives, same as `bindings` starting empty.
+    stash_scroll_enabled: bool,
     /// A weak handle back to the `Arc<TokioMutex<Overlay>>` this instance
     /// lives inside — set once in `main.rs` right after that `Arc` is
     /// constructed (`Overlay::new` can't fill it in itself, chicken-and-egg:
@@ -372,6 +383,7 @@ impl Overlay {
             interactive_since: Instant::now(),
             used_recently: true,
             area_tracker: None,
+            stash_scroll_enabled: false,
             self_ref: Weak::new(),
         };
         Ok((
@@ -459,6 +471,18 @@ impl Overlay {
     /// upstream's `OverlayWindow`.
     pub(crate) fn is_interactive(&self) -> bool {
         self.overlay_interactive
+    }
+
+    /// `pub(crate)`, not private — `area_tracker.rs`'s `stashScroll` wheel
+    /// handling checks both this and `stash_scroll_enabled` before treating
+    /// a Ctrl+wheel as anything, same as `Shortcuts.ts`'s own `!e.ctrlKey ||
+    /// !this.poeWindow.isActive || !this.stashScroll` early-return.
+    pub(crate) fn game_active(&self) -> bool {
+        self.game_active
+    }
+
+    pub(crate) fn stash_scroll_enabled(&self) -> bool {
+        self.stash_scroll_enabled
     }
 
     pub(crate) fn set_interactive(&mut self, interactive: bool) {
@@ -689,6 +713,26 @@ impl Overlay {
         // main-thread marshal, not synchronous with the call above) before
         // keys get injected — same order-of-magnitude as INJECT_STAGGER
         // and upstream's own RESTORE_AFTER, not independently tuned.
+        //
+        // **Phase C investigated replacing this with a real event
+        // (PLAN.md) — measured, not swapped in.** The candidate signal was
+        // `gtk4::Window::is-active`/`connect_is_active_notify`, which for a
+        // *toplevel* window does track real wl_keyboard enter/leave. Tested
+        // live against this fork's actual layer-shell window (tray "Toggle
+        // Overlay" over D-Bus, `hyprland/diag/C1_focus_grace/is_active.log`):
+        // the signal never fires at all, through repeated
+        // interactive/passthrough transitions — `gtk_window_is_active`'s
+        // activation tracking is wired to `xdg_toplevel`'s own
+        // ACTIVATED-state protocol, which a `zwlr_layer_surface_v1` role
+        // simply doesn't have, so there's nothing to notify. The only
+        // signal that genuinely reflects our surface's keyboard focus is
+        // the seat's `wl_keyboard.enter`/`leave` themselves, and reaching
+        // those directly would mean a new raw Wayland listener (matching
+        // our own surface's `wl_surface` id against the `Enter`/`Leave`
+        // event's `surface` argument) — real new-subsystem scope, not a
+        // swap-in for one call site. Left as a fixed wait, not because no
+        // better mechanism was considered, but because the one this task
+        // named turned out not to exist for this kind of surface.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let clients = match compositor::clients().await {
@@ -766,6 +810,11 @@ impl Overlay {
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 self.game_config.read(game_config_path).await;
+
+                self.stash_scroll_enabled = payload
+                    .get("stashScroll")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
             }
             "CLIENT->MAIN::user-action" => {
                 match payload.get("action").and_then(Value::as_str) {
@@ -801,7 +850,22 @@ impl Overlay {
                 // the overlay flips straight back to passthrough before the
                 // user can interact with what they just triggered it for.
                 let age = self.interactive_since.elapsed();
-                if self.overlay_interactive && age < FOCUS_GAME_GRACE {
+                let in_grace = self.overlay_interactive && age < FOCUS_GAME_GRACE;
+                // Diagnostic only (Phase C, PLAN.md) — measures whether the
+                // grace window is still earning its keep now that H2B no
+                // longer flips keyboard mode on every activation. Logs
+                // unconditionally (cheap, low-volume: this event only fires
+                // on real user/renderer actions); `EE2_DIAG_NO_FOCUS_GRACE`
+                // additionally *disables* the suppression below so a live
+                // session can show whether an unsolicited focus-game still
+                // arrives and gets acted on without the window catching it.
+                let diag_disabled = std::env::var_os("EE2_DIAG_NO_FOCUS_GRACE").is_some();
+                eprintln!(
+                    "ee2-hyprland: focus-game received (overlay_interactive={}, age_ms={}, in_grace={in_grace}, diag_disabled={diag_disabled})",
+                    self.overlay_interactive,
+                    age.as_millis(),
+                );
+                if in_grace && !diag_disabled {
                     return;
                 }
                 self.set_interactive(false);
@@ -882,5 +946,25 @@ impl Overlay {
                 eprintln!("ee2-hyprland: unhandled WS event: {other}");
             }
         }
+    }
+}
+
+/// `stashScroll` (Phase C, PLAN.md): ports `Shortcuts.ts`'s Ctrl+wheel
+/// tab-switch injection. `area_tracker.rs` is the one caller — it already
+/// holds only a `Weak<TokioMutex<Overlay>>` (never the strong `Arc`), same
+/// as its existing `set_overlay_interactive`/`broadcast_hide_exclusive_widget`
+/// helpers, so this takes the same shape rather than being an `Overlay`
+/// method. Locks `Overlay` just long enough to clone the `copy_item` handle
+/// — same split-lock reasoning as `run_copy_item`/`run_stash_search`: the
+/// injection itself (two `INJECT_STAGGER`-spaced key taps) must not block
+/// WS message handling or focus-change updates for its duration.
+pub(crate) async fn inject_stash_scroll_tab(overlay: &Weak<TokioMutex<Overlay>>, right: bool) {
+    let Some(overlay) = overlay.upgrade() else {
+        return;
+    };
+    let copy_item = overlay.lock().await.copy_item.clone();
+    let mut state = copy_item.lock().await;
+    if let Err(err) = state.keyboard.stash_scroll_tab(right).await {
+        eprintln!("ee2-hyprland: stash-scroll: injection failed: {err}");
     }
 }

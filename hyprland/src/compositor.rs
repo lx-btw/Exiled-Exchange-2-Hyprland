@@ -59,16 +59,25 @@ fn socket_dir() -> Option<PathBuf> {
 
 /// A client (window), as reported by `clients`/`activewindow`. Only the
 /// fields this fork actually uses — Hyprland's real schema has many more
-/// (`address`, `pid`, `at`, `size`, `mapped`, `floating`, `fullscreen`,
-/// ...); unknown fields are ignored by default rather than rejected, so a
-/// Hyprland version with extra fields still parses fine. Add fields back
-/// here if a later stage needs them (monitor geometry for overlay
-/// placement, say) rather than carrying them unused from the start.
+/// (`address`, `pid`, `mapped`, `floating`, `fullscreen`, ...); unknown
+/// fields are ignored by default rather than rejected, so a Hyprland
+/// version with extra fields still parses fine.
+///
+/// `at`/`size` (Phase C, PLAN.md, `stashScroll`'s `isStashArea` port) are
+/// already in Hyprland's global layout space — the same frame
+/// `cursor_pos()` reports in, confirmed live against a real window (`at:
+/// [0, 155]` for a window on `DP-1`, whose real origin is `y: 155` — see
+/// `overlay::window::current_monitor_origin`'s docs for the same
+/// monitor-origin fact from the renderer side). No conversion needed to
+/// compare the two directly, unlike `track-area`'s renderer-frame
+/// coordinates.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Client {
     pub class: String,
     pub title: String,
     pub xwayland: bool,
+    pub at: (i32, i32),
+    pub size: (i32, i32),
 }
 
 #[derive(Debug, Deserialize)]
