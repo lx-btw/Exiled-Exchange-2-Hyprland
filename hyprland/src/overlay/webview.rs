@@ -18,39 +18,19 @@ const ELECTRON_UA_SUBSTRING: &str = "Electron/44.0.0";
 /// Builds a transparent WebView loading `url`, tagged with the UA substring
 /// the renderer's transport check requires.
 ///
-/// **The Stage 1 WebView-transparency bug is still open** (see PLAN.md).
-/// Three isolated fix attempts during Stage 5 (2026-09-24), each tested
-/// alone against a live Hyprland session:
-///
-/// 1. A `window.rs` GTK-level CSS provider forcing the window's own
-///    background transparent (working around a system theme's opaque
-///    `.background` rule) — no visible change.
-/// 2. `webview.set_background_color()` swapped between `TRANSPARENT` and
-///    opaque magenta — pixel-identical screenshots either way. This call
-///    has *zero* effect on what's actually on screen on this system.
-/// 3. A `UserStyleLevel::User` `UserStyleSheet` forcing `color-scheme:
-///    normal` and `background-color: transparent` on `html`/`body`
-///    (`renderer/index.html` sets `<meta name="color-scheme" content="dark">`
-///    and can't be edited directly — fork boundary) — also no visible
-///    change, *and* this one additionally broke `KeyboardMode::Exclusive`:
-///    hotkey presses (Ctrl+D, Shift+Space) stopped reliably capturing
-///    input, leaking through to the game (character moved/rolled) even
-///    though `render-state`/dispatch logs showed everything else working
-///    correctly. Mechanism unconfirmed — nothing about installing a
-///    `UserContentManager` stylesheet should plausibly touch GTK/layer-shell
-///    input handling, but it reproduced twice and reverting it alone (with
-///    `window.rs` already reverted from attempt 1) restored correct
-///    keyboard capture both times.
-///
-/// Net result: the opaque backdrop survives every tested fix, suggesting a
-/// lower-level compositing issue (WebKit6/GSK not preserving an alpha
-/// channel through to the Wayland buffer at all, regardless of what CSS or
-/// the WebKit API say) rather than a simple CSS-cascade problem. Revisit
-/// with lower-level tools (`GTK_DEBUG`/`WEBKIT_*` env vars, inspecting the
-/// actual buffer format reaching the compositor) rather than more CSS
-/// attempts — and never bundle a fix attempt here with anything else, given
-/// how attempt 3 masked a real input-handling regression behind what looked
-/// like a purely cosmetic change.
+/// **The Stage 1 WebView-transparency bug is fixed** — root cause and the
+/// actual fix are in `window.rs`'s `build()` doc comment (a system GTK4
+/// theme's opaque `.background` rule, defeated with a `CssProvider` on the
+/// *window*, not the page). `set_background_color(TRANSPARENT)` below is
+/// kept as the spec-correct call for a transparent `WebView` — real testing
+/// during Phase A (2026-09-24) found it has no independent effect either
+/// way on this system, since the window-level fix alone already gets GDK to
+/// stop reporting an opaque region at all — but there's no reason to set it
+/// to anything else. Deliberately **not** using a `UserStyleSheet` to force
+/// `html`/`body` transparent from here: an earlier attempt at that (Stage 5,
+/// 2026-09-24) reproducibly broke `KeyboardMode::Exclusive` (hotkeys stopped
+/// reliably capturing input) through an unconfirmed mechanism — the
+/// window-level fix doesn't need it, so don't reintroduce it.
 pub fn build(url: &str) -> WebView {
     let webview = WebView::new();
 

@@ -31,27 +31,43 @@ use webkit6::WebView;
 /// Starts in passthrough mode — nothing steals input until something (a
 /// hotkey, Stage 2+) switches it to interactive.
 ///
-/// **The Stage 1 WebView-transparency bug is still open** (see PLAN.md): an
-/// interactive/visible overlay currently paints an opaque backdrop instead
-/// of showing the desktop/game through it. A `STYLE_PROVIDER_PRIORITY_USER`
-/// CSS provider forcing `window { background-color: transparent }` here
-/// (paired with a `webview.rs` user stylesheet forcing the *page's* own
-/// `html`/`body` transparent, working around a system GTK4 theme's opaque
-/// `.background` rule that otherwise wins the cascade) was tried and
-/// reverted during Stage 5 (2026-09-24): it didn't fix the transparency,
-/// and combined with going through this exact code path, hotkey-triggered
-/// `KeyboardMode::Exclusive` stopped reliably capturing input — pressing
-/// the trigger combo no longer reliably prevented the game from also
-/// seeing the keypress. Root cause not confirmed (the leading theory was a
-/// startup-hidden/not-yet-mapped surface race with the CSS change compounding
-/// it, but a targeted ordering fix in `state.rs` didn't resolve it either).
-/// Revisit as its own isolated change, verified against actual keyboard
-/// capture as well as visuals, not bundled with anything else.
+/// **The Stage 1 WebView-transparency bug is fixed (Phase A, 2026-09-24;
+/// see PLAN.md).** Root cause: the system GTK4 theme's
+/// `~/.config/gtk-4.0/gtk.css` unconditionally paints `.background` (a CSS
+/// class every top-level `GtkWindow` gets) fully opaque
+/// (`background-color: #1e1e2e`). That's a real, correctly-rendered opaque
+/// pixel in this window's own buffer, so GDK's Wayland backend correctly
+/// reports it to the compositor via `wl_surface.set_opaque_region` covering
+/// the whole surface — confirmed with `WAYLAND_DEBUG=1`
+/// (`hyprland/examples/transparency_lab.rs`): without this fix, a
+/// `wl_region.add(0, 0, <monitor W>, <monitor H>)` +
+/// `wl_surface.set_opaque_region(...)` is sent right before every commit;
+/// with it, `set_opaque_region` is never sent at all (GDK computes there's
+/// no opaque content and lets the Wayland-spec no-opaque-region default
+/// apply), and Hyprland correctly alpha-blends. This was never a Hyprland
+/// occlusion-culling behavior, a "stuck"/unclearable opaque region, or a
+/// WebKit/GSK alpha-channel problem — see PLAN.md's Phase A writeup for the
+/// full trace and the (surprisingly wrong) earlier hypotheses this rules
+/// out. The `CssProvider` below defeats that theme rule the standard GTK
+/// way (a `STYLE_PROVIDER_PRIORITY_USER` provider outranks the theme's
+/// `PRIORITY_THEME` one for the same selector), which is what makes this a
+/// clean fix through GTK's own public behavior rather than a
+/// protocol-level workaround.
 pub fn build(app: &gtk4::Application, webview: &WebView) -> gtk4::ApplicationWindow {
     let window = gtk4::ApplicationWindow::builder()
         .application(app)
         .title("Exiled Exchange 2")
         .build();
+
+    if let Some(display) = gtk4::gdk::Display::default() {
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data("window, window.background { background-color: transparent; }");
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_USER,
+        );
+    }
 
     // Layer-shell setup must happen before the window is realized.
     window.init_layer_shell();
@@ -114,12 +130,10 @@ pub fn set_passthrough(window: &gtk4::ApplicationWindow, passthrough: bool) {
 /// `OVERLAY->MAIN::render-state`'s `shouldShow` (`state.rs`) — the
 /// renderer's own signal for "is there any widget content visible right
 /// now" (`OverlayWindow.vue`'s `isOverlayVisible`), not to be confused with
-/// interactive-vs-passthrough. Hiding when there's nothing to show also
-/// happens to paper over the still-unresolved WebView transparency issue
-/// from Stage 1 (`webview.rs`'s `set_background_color(TRANSPARENT)` doesn't
-/// produce real alpha — see PLAN.md): an unmapped layer surface shows
-/// nothing at all, transparent or not, so the solid backdrop that bug
-/// produces is simply never on screen while idle.
+/// interactive-vs-passthrough. Also a safety net independent of the
+/// transparency fix above: an unmapped layer surface shows nothing at all,
+/// so any future rendering regression stays invisible instead of painting
+/// over the desktop/game.
 pub fn set_visible(window: &gtk4::ApplicationWindow, visible: bool) {
     window.set_visible(visible);
 }

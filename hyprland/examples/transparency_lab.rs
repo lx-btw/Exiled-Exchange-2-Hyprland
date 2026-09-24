@@ -28,6 +28,27 @@
 //!                                  transparent; magenta is the "does this
 //!                                  API do anything at all" sanity check
 //!                                  from today's live session.
+//!   EE2_LAB_ANCHOR=top             anchor Top+Left+Right only (not
+//!                                  Bottom), height from EE2_LAB_HEIGHT
+//!                                  (default 400), exclusive_zone left at
+//!                                  the default (0) unless
+//!                                  EE2_LAB_EXCLUSIVE_NEG1=1. For the Phase A
+//!                                  threshold-bisection test: does the
+//!                                  surface stop blending once its height
+//!                                  reaches the DP-1 work-area height
+//!                                  (1393px, i.e. monitor height 1440 minus
+//!                                  the 47px reserved top panel)?
+//!   EE2_LAB_HEIGHT=N                height in px for EE2_LAB_ANCHOR=top.
+//!   EE2_LAB_EXCLUSIVE_NEG1=1        (EE2_LAB_ANCHOR=top only) also set
+//!                                  exclusive_zone(-1), matching the real
+//!                                  overlay's full-monitor surface.
+//!   EE2_LAB_MONITOR=<connector>     pin the layer surface to a specific
+//!                                  output (e.g. DP-2) via
+//!                                  gtk_layer_set_monitor, instead of
+//!                                  whatever output GTK picks by default.
+//!                                  Lets a test target an output with no
+//!                                  other clients on its active workspace,
+//!                                  without switching workspaces.
 //!
 //! Every mode draws a semi-transparent magenta marker box in the corner
 //! (rgba, 40% alpha) as a position/blend sanity check distinct from the
@@ -84,6 +105,22 @@ fn main() -> gtk4::glib::ExitCode {
         }
 
         window.init_layer_shell();
+        if let Ok(connector) = std::env::var("EE2_LAB_MONITOR") {
+            if let Some(display) = gtk4::gdk::Display::default() {
+                let monitors = display.monitors();
+                let found = (0..monitors.n_items()).find_map(|i| {
+                    let m = monitors.item(i)?.downcast::<gtk4::gdk::Monitor>().ok()?;
+                    (m.connector().as_deref() == Some(connector.as_str())).then_some(m)
+                });
+                match &found {
+                    Some(_) => eprintln!("transparency-lab: pinned to monitor {connector}"),
+                    None => {
+                        eprintln!("transparency-lab: monitor {connector} not found, using default")
+                    }
+                }
+                window.set_monitor(found.as_ref());
+            }
+        }
         window.set_layer(if env_flag("EE2_LAB_LAYER_TOP") {
             Layer::Top
         } else {
@@ -100,6 +137,19 @@ fn main() -> gtk4::glib::ExitCode {
                 })
                 .unwrap_or((300, 200));
             window.set_default_size(w, h);
+        } else if std::env::var("EE2_LAB_ANCHOR").as_deref() == Ok("top") {
+            window.set_anchor(Edge::Top, true);
+            window.set_anchor(Edge::Left, true);
+            window.set_anchor(Edge::Right, true);
+            window.set_anchor(Edge::Bottom, false);
+            let height: i32 = std::env::var("EE2_LAB_HEIGHT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(400);
+            window.set_default_size(-1, height);
+            if env_flag("EE2_LAB_EXCLUSIVE_NEG1") {
+                window.set_exclusive_zone(-1);
+            }
         } else {
             for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
                 window.set_anchor(edge, true);
