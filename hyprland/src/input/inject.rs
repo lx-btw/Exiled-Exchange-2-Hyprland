@@ -168,4 +168,54 @@ impl VirtualKeyboard {
         })
         .await
     }
+
+    /// Opens the chat box with a plain `Enter`, ported from
+    /// `text-box.ts::typeInChat`'s default (non-`@last`) branch.
+    /// `select_existing`: whether to also `Ctrl+A` before the caller's own
+    /// paste — upstream skips this when the pasted text starts with one of
+    /// PoE2's own channel prefixes (`#%@$&/`), which already clear/replace
+    /// the box's content on their own, so selecting first would be
+    /// redundant (`state.rs::classify_chat_paste` decides this).
+    pub async fn open_chat(&mut self, select_existing: bool) -> io::Result<()> {
+        self.tap(KeyCode::KEY_ENTER).await?;
+        if select_existing {
+            self.tap_with_ctrl(KeyCode::KEY_A).await?;
+        }
+        Ok(())
+    }
+
+    /// `Ctrl+Enter` — opens the chat box addressed to whoever last
+    /// whispered you, ported from `typeInChat`'s `@last`-prefix/suffix
+    /// branches.
+    pub async fn open_chat_reply_to_last(&mut self) -> io::Result<()> {
+        self.tap_with_ctrl(KeyCode::KEY_ENTER).await
+    }
+
+    /// `Home, Home, Delete` — ported verbatim from `typeInChat`'s
+    /// "`@last` at the end" branch. Upstream's own comment: pressing `Home`
+    /// twice is needed to actually focus the input when using a
+    /// controller — kept even though this fork has no controller-input
+    /// path, since it's harmless with a keyboard and this is meant to be a
+    /// faithful port.
+    pub async fn chat_move_home_twice_and_delete(&mut self) -> io::Result<()> {
+        self.tap(KeyCode::KEY_HOME).await?;
+        self.tap(KeyCode::KEY_HOME).await?;
+        self.tap(KeyCode::KEY_DELETE).await
+    }
+
+    /// `Ctrl+V` — pastes whatever `clipboard::write_text_restoring` already
+    /// placed on the clipboard. Common to every `typeInChat` branch,
+    /// upstream taps it once after the branch-specific chat-opening
+    /// sequence regardless of which one ran.
+    pub async fn paste_clipboard(&mut self) -> io::Result<()> {
+        self.tap_with_ctrl(KeyCode::KEY_V).await
+    }
+
+    /// A plain `Enter` to send the typed/pasted chat message. Upstream's
+    /// `typeInChat` follows this with a "restore the last chat" tail
+    /// (`Enter, Enter, ArrowUp, ArrowUp, Escape`) — deliberately NOT ported
+    /// here; see `state.rs::run_paste_in_chat`'s docs for why.
+    pub async fn send_chat_message(&mut self) -> io::Result<()> {
+        self.tap(KeyCode::KEY_ENTER).await
+    }
 }

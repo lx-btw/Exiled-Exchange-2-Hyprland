@@ -192,23 +192,56 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
                     previous.destroy();
                 }
 
-                let Some(offer) = id else { return };
+                let Some(offer) = id else {
+                    // Selection cleared entirely (no offer at all) — nothing
+                    // currently on the clipboard to report as "current".
+                    if let Some(cell) = LAST_TEXT.get() {
+                        *cell.lock().unwrap() = None;
+                    }
+                    return;
+                };
 
                 let mime_types = offer
                     .data::<OfferMimeTypes>()
                     .map(|m| m.lock().unwrap().clone())
                     .unwrap_or_default();
 
-                match pick_mime_type(&mime_types).and_then(|mime| receive(conn, &offer, mime).ok())
-                {
+                // A selection we ourselves just wrote (`write_text`/
+                // `write_text_restoring`) carries this marker MIME type —
+                // skip reading it back here. Without this, this read loop
+                // would issue its own `Receive` against *every* source we
+                // create (needed so a genuine external copy, e.g. the
+                // game's `Ctrl+Alt+C`, is ever seen at all) — and answering
+                // that `Receive` is exactly what fires the source's `Send`
+                // event, the same signal `Settle` treats as "the game
+                // consumed it". Left unguarded, `Settle` fired within
+                // microseconds of every write regardless of whether
+                // anything external ever actually read it — found via a
+                // flaky test racing exactly this, not anticipated in
+                // advance.
+                if mime_types.iter().any(|m| m == OWN_WRITE_MARKER_MIME) {
+                    state.current_offer = Some(offer);
+                    return;
+                }
+
+                let text =
+                    pick_mime_type(&mime_types).and_then(|mime| receive(conn, &offer, mime).ok());
+
+                match &text {
                     Some(text) => {
-                        let _ = state.tx.send(ClipboardEvent::Selection(text));
+                        let _ = state.tx.send(ClipboardEvent::Selection(text.clone()));
                     }
                     None => {
                         eprintln!(
                             "ee2-hyprland: clipboard selection offered no usable text MIME type"
                         );
                     }
+                }
+                // Cached unconditionally (not just on a MIME-type hit) so
+                // `current_text()` reflects reality either way — see that
+                // function's docs for why this cache exists at all.
+                if let Some(cell) = LAST_TEXT.get() {
+                    *cell.lock().unwrap() = text;
                 }
 
                 state.current_offer = Some(offer);
@@ -323,6 +356,8 @@ fn receive(
 /// `Overlay::new` (the sole caller) doing both here rather than exposing a
 /// second `spawn`-like entry point keeps that call site simple.
 pub fn spawn() -> io::Result<mpsc::UnboundedReceiver<ClipboardEvent>> {
+    let _ = LAST_TEXT.set(Mutex::new(None));
+
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
         .name("ee2-hyprland-clipboard".into())
@@ -353,8 +388,9 @@ pub fn spawn() -> io::Result<mpsc::UnboundedReceiver<ClipboardEvent>> {
     Ok(rx)
 }
 
-/// A pending `write_text` call's payload, queued for `run_writer`'s thread
-/// to pick up and turn into a real `zwlr_data_control_source_v1`.
+/// A pending `write_text`/`write_text_restoring` call's payload, queued for
+/// `run_writer`'s thread to pick up and turn into a real
+/// `zwlr_data_control_source_v1`.
 struct WriteJob {
     text: String,
     done: oneshot::Sender<io::Result<()>>,
@@ -375,6 +411,18 @@ struct WriteQueue {
 /// race it) — `write_text` treats an unset queue as a caller-ordering bug,
 /// not a transient condition to retry.
 static WRITE_QUEUE: OnceLock<Arc<WriteQueue>> = OnceLock::new();
+
+/// The most recently observed native-Wayland clipboard text — updated on
+/// every real `Selection` event `State`'s `Dispatch` impl processes (see
+/// above), *not* filtered by `is_poe_item`: this exists purely to answer
+/// "what's on the clipboard right now" for `current_text()`
+/// (`restoreClipboard`'s "read the buffer before we overwrite it" need),
+/// which wants the user's real previous content, not just item copies.
+/// Reading it is an instant mutex lock, not a synchronous protocol
+/// round-trip or a subprocess spawn — by the time any caller asks, the
+/// answer is already sitting here from the last real event. Set once by
+/// `spawn()`, same lifetime contract as `WRITE_QUEUE`.
+static LAST_TEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Dispatch target for `run_writer`'s own connection — deliberately separate
 /// from `State` (the read loop's dispatch target) even though the
@@ -462,9 +510,11 @@ impl Dispatch<ZwlrDataControlOfferV1, ()> for WriterState {
 }
 
 /// Each live `ZwlrDataControlSourceV1`'s user-data: the exact text it needs
-/// to hand back on every `Send`, however many times the game asks (a
-/// clipboard manager or the game itself may paste more than once before the
-/// next `write_text` replaces this selection).
+/// to hand back on every `Send`, however many times a reader asks (a
+/// clipboard-history daemon and/or the game itself may request it more than
+/// once before the next `write_text` replaces this selection — see
+/// `write_text_restoring`'s docs on why this file doesn't try to treat
+/// `Send` as "the game specifically consumed it").
 impl Dispatch<ZwlrDataControlSourceV1, Mutex<String>> for WriterState {
     fn event(
         _: &mut Self,
@@ -506,6 +556,17 @@ impl Dispatch<ZwlrDataControlSourceV1, Mutex<String>> for WriterState {
 /// text, not something that actually varies by encoding label.
 const OFFERED_MIME_TYPES: &[&str] = &["text/plain;charset=utf-8", "text/plain", "UTF8_STRING"];
 
+/// A private, made-up MIME type offered alongside the real text ones on
+/// every source this process creates — lets `State`'s (read-side) Selection
+/// handler recognize "this is our own write" and skip reading it back (see
+/// that handler's docs for why that matters). Real clients (the game,
+/// `wl-paste`, …) are expected to ignore MIME types they don't recognize,
+/// same as they'd ignore any other type this process didn't happen to
+/// offer — this isn't part of any real protocol, just an in-process marker
+/// riding along on the one channel (the offer's own MIME list) both sides
+/// of this file already read.
+const OWN_WRITE_MARKER_MIME: &str = "application/x-ee2-hyprland-own-write";
+
 /// Runs on its own dedicated OS thread and its own Wayland connection,
 /// separate from `run()`'s read loop above — a source has to keep answering
 /// `Send` for as long as it holds the selection (potentially long after the
@@ -545,6 +606,7 @@ fn run_writer(queue: Arc<WriteQueue>) -> Result<(), Box<dyn std::error::Error>> 
             for mime in OFFERED_MIME_TYPES {
                 source.offer(mime.to_string());
             }
+            source.offer(OWN_WRITE_MARKER_MIME.to_string());
             device.set_selection(Some(&source));
             conn.flush()?;
             // `write_text` only needs to know the selection was handed to
@@ -640,40 +702,146 @@ async fn read_x11_selection() -> io::Result<String> {
 /// The native-Wayland path (Phase C, PLAN.md) no longer shells out to
 /// `wl-copy` — it hands the text to `run_writer`'s thread over
 /// `WRITE_QUEUE`, which creates a real `zwlr_data_control_source_v1` on the
-/// connection it already holds open and answers `Send` itself. Stash-search
-/// (`state.rs::run_stash_search`) is the only caller.
+/// connection it already holds open and answers `Send` itself. Thin
+/// fire-and-forget wrapper around `write_text_xwayland`/`write_text_native`
+/// — `write_text_restoring` (Phase D) is the one that also arranges a
+/// later restore.
 pub async fn write_text(text: &str, xwayland: bool) -> io::Result<()> {
     if xwayland {
-        use tokio::io::AsyncWriteExt;
-
-        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
-        let mut child = tokio::process::Command::new("xsel")
-            .args(["-b", "-i"])
-            .env("DISPLAY", display)
-            .stdin(std::process::Stdio::piped())
-            .spawn()?;
-        let mut stdin = child.stdin.take().expect("stdin was piped above");
-        stdin.write_all(text.as_bytes()).await?;
-        drop(stdin); // EOF, so the reading end (xsel) can return
-
-        let status = child.wait().await?;
-        if !status.success() {
-            return Err(io::Error::other(format!("xsel exited with {status}")));
-        }
-        Ok(())
+        write_text_xwayland(text).await
     } else {
-        let queue = WRITE_QUEUE.get().ok_or_else(|| {
-            io::Error::other("clipboard writer not started (spawn() not called yet)")
-        })?;
-        let (done_tx, done_rx) = oneshot::channel();
-        queue.jobs.lock().unwrap().push_back(WriteJob {
-            text: text.to_string(),
-            done: done_tx,
-        });
-        rustix::io::write(&queue.wake, &1u64.to_ne_bytes())?;
-        done_rx
-            .await
-            .map_err(|_| io::Error::other("clipboard writer thread exited"))?
+        write_text_native(text).await
+    }
+}
+
+/// The Xwayland write itself — `write_text`'s xwayland arm and
+/// `write_text_restoring`'s restore write (Xwayland path) both need exactly
+/// this, split out so neither re-derives the `DISPLAY` fallback or the
+/// piped-stdin dance.
+async fn write_text_xwayland(text: &str) -> io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".to_string());
+    let mut child = tokio::process::Command::new("xsel")
+        .args(["-b", "-i"])
+        .env("DISPLAY", display)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin was piped above");
+    stdin.write_all(text.as_bytes()).await?;
+    drop(stdin); // EOF, so the reading end (xsel) can return
+
+    let status = child.wait().await?;
+    if !status.success() {
+        return Err(io::Error::other(format!("xsel exited with {status}")));
+    }
+    Ok(())
+}
+
+/// How long to wait before restoring the clipboard to its pre-write value
+/// (or, with `restoreClipboard` off, just releasing the caller's throttle)
+/// — the same fixed-wait approach upstream's `HostClipboard.RESTORE_AFTER`
+/// uses, and the same value (120ms), on **both** paths.
+///
+/// An earlier version of this tried to be event-driven on the native path:
+/// fire the restore from the write source's own `Send` event instead of
+/// guessing a delay — genuinely a real signal, and it worked... right up
+/// until it was tested against this dev system's own clipboard-history
+/// daemons (`wl-clip-persist` and `wl-paste --watch … | cliphist store`,
+/// confirmed running via `ps aux`), which answer `Receive` against *any*
+/// clipboard write within microseconds — indistinguishable at the protocol
+/// level from the game itself pasting. A Hyprland desktop running a
+/// clipboard-history manager is a common setup, not an edge case (this
+/// session's own dev machine has one), so `Send` can't actually tell "the
+/// game consumed it" apart from "a clipboard-history tool eagerly consumed
+/// it" — the same class of problem upstream's own `HostClipboard.ts`
+/// comments already call out for KDE's "Prevent empty clipboard" feature
+/// and the Proton 10 clipboard bug, just hit here from a different
+/// direction. `current_text()` below is still the event-fed, no-timer,
+/// no-subprocess primitive for "what's on the clipboard right now" — it's
+/// specifically "when has this write been consumed" that turned out to
+/// have no reliable signal at this protocol layer, so restoring falls back
+/// to upstream's own proven fixed wait rather than continuing to chase a
+/// signal that doesn't actually exist here.
+const RESTORE_AFTER: Duration = Duration::from_millis(120);
+
+/// Writes `text` to the clipboard the game will read from, same as
+/// `write_text`, but additionally arranges to write `restore_to` back (if
+/// `Some`) `RESTORE_AFTER` later — ported from
+/// `HostClipboard.restoreShortly`'s save-before/restore-after behavior (see
+/// `RESTORE_AFTER`'s docs for why this is a fixed wait rather than
+/// event-driven, on both paths). Returns a receiver that resolves once
+/// `RESTORE_AFTER` has elapsed and the restore write (if any) was
+/// attempted — whether or not `restore_to` was `Some`, so a caller wanting
+/// the same "don't overlap two of these" protection upstream's
+/// `isRestored` flag gave doesn't have to guess a wait either
+/// (`state.rs`'s `chat_action_in_flight` is exactly this).
+pub async fn write_text_restoring(
+    text: &str,
+    xwayland: bool,
+    restore_to: Option<String>,
+) -> io::Result<oneshot::Receiver<()>> {
+    if xwayland {
+        write_text_xwayland(text).await?;
+    } else {
+        write_text_native(text).await?;
+    }
+
+    let (settled_tx, settled_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(RESTORE_AFTER).await;
+        if let Some(restore_to) = restore_to {
+            let result = if xwayland {
+                write_text_xwayland(&restore_to).await
+            } else {
+                write_text_native(&restore_to).await
+            };
+            if let Err(err) = result {
+                eprintln!("ee2-hyprland: clipboard: restore write failed: {err}");
+            }
+        }
+        let _ = settled_tx.send(());
+    });
+    Ok(settled_rx)
+}
+
+/// The native-Wayland write itself — hands `text` to `run_writer`'s thread
+/// over `WRITE_QUEUE`, which creates a real `zwlr_data_control_source_v1`
+/// on the connection it already holds open and answers `Send` itself (no
+/// `wl-copy` subprocess, Phase C, PLAN.md). Split out of `write_text`/
+/// `write_text_restoring` since both need exactly this, with nothing else
+/// attached.
+async fn write_text_native(text: &str) -> io::Result<()> {
+    let queue = WRITE_QUEUE
+        .get()
+        .ok_or_else(|| io::Error::other("clipboard writer not started (spawn() not called yet)"))?;
+    let (done_tx, done_rx) = oneshot::channel();
+    queue.jobs.lock().unwrap().push_back(WriteJob {
+        text: text.to_string(),
+        done: done_tx,
+    });
+    rustix::io::write(&queue.wake, &1u64.to_ne_bytes())?;
+    done_rx
+        .await
+        .map_err(|_| io::Error::other("clipboard writer thread exited"))?
+}
+
+/// Reads whatever's on the clipboard *right now*, without triggering a
+/// fresh copy or waiting for one — the primitive `restoreClipboard` needs
+/// to capture the user's real previous content before `write_text_restoring`
+/// overwrites it. Native-Wayland: an instant read of `LAST_TEXT` (populated
+/// from real `Selection` events as they happen — no subprocess, no timer).
+/// Xwayland: one direct `xsel -b -o` read, same as `read_item_text`'s own
+/// Xwayland path already does — not a poll loop, just a single synchronous
+/// snapshot, since X11 has no equivalent of `LAST_TEXT`'s event-fed cache
+/// to read from instead.
+pub async fn current_text(xwayland: bool) -> Option<String> {
+    if xwayland {
+        read_x11_selection().await.ok()
+    } else {
+        LAST_TEXT
+            .get()
+            .and_then(|cell| cell.lock().unwrap().clone())
     }
 }
 
@@ -725,6 +893,16 @@ pub async fn read_item_text(
 mod tests {
     use super::*;
 
+    /// The test harness runs `#[tokio::test]`s in parallel by default (each
+    /// on its own OS thread), but every test in this module drives the
+    /// *same* real system clipboard through the *same* real Hyprland
+    /// session — two tests writing concurrently would race each other's
+    /// `wl-paste` reads regardless of either test's own logic being
+    /// correct. `tokio::sync::Mutex` (not `std::sync::Mutex`) specifically
+    /// because its guard is safely held across `.await` points, which
+    /// every test here does throughout.
+    static CLIPBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Phase C (PLAN.md): `write_text`'s native-Wayland path used to shell
     /// out to `wl-copy` per call; it now creates its own
     /// `zwlr_data_control_source_v1` on `run_writer`'s connection. This is
@@ -735,6 +913,8 @@ mod tests {
     /// itself can't run at all, e.g. no `WAYLAND_DISPLAY`).
     #[tokio::test]
     async fn write_text_round_trips_without_a_wl_copy_subprocess() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+
         async fn wl_copy_pids() -> Vec<u8> {
             // Snapshot before/after, compared for equality below — some
             // systems already run an unrelated long-lived `wl-copy`
@@ -779,6 +959,65 @@ mod tests {
         assert_eq!(
             before, after,
             "a new wl-copy process appeared — write_text should never spawn one"
+        );
+    }
+
+    /// The restoreClipboard mechanism (PLAN.md): confirms both halves of
+    /// `write_text_restoring` against the real system clipboard — the new
+    /// text is actually readable immediately after the write, and the
+    /// previous value lands back on the clipboard `RESTORE_AFTER` later.
+    /// This system runs real clipboard-history watchers
+    /// (`wl-clip-persist`/`wl-paste --watch … | cliphist store`, confirmed
+    /// via `ps aux` — see `RESTORE_AFTER`'s docs) that read every selection
+    /// change within microseconds, which is exactly what ruled out an
+    /// earlier `Send`-event-driven version of this mechanism; this test's
+    /// own `wl-paste` read exercises the same "something external reads it
+    /// almost immediately" condition and confirms the fixed-wait design
+    /// isn't thrown off by it either.
+    #[tokio::test]
+    async fn write_text_restoring_restores_after_the_wait() {
+        let _guard = CLIPBOARD_TEST_LOCK.lock().await;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let marker_new = format!("ee2-hyprland clipboard.rs restore-test new {nanos}");
+        let marker_old = format!("ee2-hyprland clipboard.rs restore-test old {nanos}");
+
+        let _rx = spawn().expect("clipboard::spawn");
+
+        let settled_rx = write_text_restoring(
+            &marker_new,
+            /* xwayland */ false,
+            Some(marker_old.clone()),
+        )
+        .await
+        .expect("write_text_restoring");
+
+        let output = tokio::process::Command::new("wl-paste")
+            .arg("-n")
+            .output()
+            .await
+            .expect("wl-paste");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), marker_new);
+
+        // Bounded well beyond `RESTORE_AFTER` — a hang here means the
+        // restore/settle mechanism itself is broken, not just slow.
+        tokio::time::timeout(Duration::from_secs(2), settled_rx)
+            .await
+            .expect("write_text_restoring's settle signal never arrived")
+            .expect("settle sender dropped without firing");
+
+        let output = tokio::process::Command::new("wl-paste")
+            .arg("-n")
+            .output()
+            .await
+            .expect("wl-paste");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            marker_old,
+            "clipboard wasn't restored to the previous value after RESTORE_AFTER"
         );
     }
 }

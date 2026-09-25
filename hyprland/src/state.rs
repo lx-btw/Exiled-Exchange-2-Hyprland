@@ -17,11 +17,13 @@
 //! Stage 4 (see PLAN.md).
 
 use std::cell::{Cell, RefCell};
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, watch, Mutex as TokioMutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as TokioMutex};
 
 use crate::area_tracker;
 use crate::clipboard::{self, ClipboardEvent};
@@ -153,14 +155,16 @@ fn set_visible_on_main_thread(visible: bool) {
 }
 
 /// A parsed `ShortcutAction` (`ipc/types.ts`) this fork can actually act on.
-/// Action types not listed here (`ocr-text`, `paste-in-chat`, `test-only`)
-/// are still Stage 5+ and are dropped during parsing — see `parse_bindings`.
+/// Action types not listed here (`ocr-text`, `test-only`) are still Stage 5+
+/// (`ocr-text` is N/A — Windows-only upstream, heist-gem OCR) and are
+/// dropped during parsing — see `parse_bindings`.
 #[derive(Debug, Clone)]
 enum Action {
     CopyItem { target: String, focus_overlay: bool },
     ToggleOverlay,
     TriggerEvent { target: String },
     StashSearch { text: String },
+    PasteInChat { text: String, send: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -226,6 +230,21 @@ fn parse_bindings(shortcuts: &[Value]) -> Vec<Binding> {
                         text: text.to_string(),
                     }
                 }
+                "paste-in-chat" => {
+                    let Some(text) = action_val.get("text").and_then(Value::as_str) else {
+                        eprintln!(
+                            "ee2-hyprland: shortcut \"{shortcut_str}\": paste-in-chat action missing \"text\", skipping"
+                        );
+                        return None;
+                    };
+                    Action::PasteInChat {
+                        text: text.to_string(),
+                        send: action_val
+                            .get("send")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    }
+                }
                 other => {
                     eprintln!(
                         "ee2-hyprland: shortcut \"{shortcut_str}\": action \"{other}\" not yet supported, skipping"
@@ -238,6 +257,54 @@ fn parse_bindings(shortcuts: &[Value]) -> Vec<Binding> {
             Some(Binding { shortcut, action })
         })
         .collect()
+}
+
+/// PoE2's chat-command prefixes that already clear/replace whatever's in
+/// the chat box on their own — ported verbatim from
+/// `text-box.ts`'s `AUTO_CLEAR`. When the pasted text starts with one of
+/// these, `classify_chat_paste` skips the `Ctrl+A` select-existing step,
+/// matching upstream exactly.
+const CHAT_AUTO_CLEAR: [char; 6] = ['#', '%', '@', '$', '&', '/'];
+
+/// Which of `typeInChat`'s three branches a `paste-in-chat` text falls
+/// into — decides both the clipboard text actually written (the `@last`
+/// placeholder itself is never pasted) and which key sequence
+/// `run_paste_in_chat` uses to open the chat box.
+#[derive(Debug, Clone, Copy)]
+enum ChatPasteKind {
+    /// `"@last ..."` — reply to whoever last whispered you (`Ctrl+Enter`).
+    ReplyToLast,
+    /// `"... @last"` — same, but the placeholder was at the end; needs the
+    /// extra `Home, Home, Delete` upstream's own comment says is for
+    /// controller-input focus.
+    ReplyToLastTrailing,
+    /// A plain command/message; the `bool` is whether to `Ctrl+A` first
+    /// (skipped when the text already starts with a channel prefix that
+    /// clears the box on its own).
+    Plain(bool),
+}
+
+/// Ports `text-box.ts::typeInChat`'s branch selection and text-slicing.
+/// Upstream checks `text.startsWith("@last")` (no trailing space required
+/// by the check itself) then unconditionally slices off `"@last ".length`
+/// (6) characters — a loose check carried over faithfully rather than
+/// tightened, but done here with `str::get` instead of upstream's
+/// unchecked JS `.slice()` so a malformed/multi-byte edge case can't land
+/// mid-character and panic; it just yields an empty remainder instead.
+fn classify_chat_paste(text: &str) -> (String, ChatPasteKind) {
+    const LAST: &str = "@last";
+    if text.starts_with(LAST) {
+        let rest = text.get(LAST.len() + 1..).unwrap_or("").to_string();
+        (rest, ChatPasteKind::ReplyToLast)
+    } else if let Some(rest) = text.strip_suffix(LAST) {
+        (rest.to_string(), ChatPasteKind::ReplyToLastTrailing)
+    } else {
+        let select_existing = !text
+            .chars()
+            .next()
+            .is_some_and(|c| CHAT_AUTO_CLEAR.contains(&c));
+        (text.to_string(), ChatPasteKind::Plain(select_existing))
+    }
 }
 
 /// The copy-item flow's exclusive resources, behind their *own* lock,
@@ -314,6 +381,21 @@ pub struct Overlay {
     /// default (`true`) — nothing here acts on it until the real
     /// `update-host-config` arrives, same as `bindings` starting empty.
     stash_scroll_enabled: bool,
+    /// `restoreClipboard` (`HostConfig`): whether `run_copy_item`/
+    /// `run_stash_search`/`run_paste_in_chat` should write the user's prior
+    /// clipboard content back once their own write has settled — mirrored
+    /// from `update-host-config` the same way `stash_scroll_enabled` is.
+    /// Default `false`, matching upstream's `HostClipboard.shouldRestore`
+    /// (unset/falsy until `updateOptions` runs).
+    restore_clipboard_enabled: bool,
+    /// Ports `HostClipboard`'s `isRestored`-based throttle: `restoreShortly`
+    /// (`run_stash_search`/`run_paste_in_chat`, both write to the game's
+    /// clipboard and inject keys) refuses to start a new one while a
+    /// previous one hasn't settled yet, guarding against the same "Too many
+    /// actions" disconnect upstream's own comment names. One flag shared
+    /// across both actions, same as upstream's single `HostClipboard`
+    /// instance backs both `typeInChat` and `stashSearch`.
+    chat_action_in_flight: Arc<AtomicBool>,
     /// A weak handle back to the `Arc<TokioMutex<Overlay>>` this instance
     /// lives inside — set once in `main.rs` right after that `Arc` is
     /// constructed (`Overlay::new` can't fill it in itself, chicken-and-egg:
@@ -364,6 +446,8 @@ impl Overlay {
             used_recently: true,
             area_tracker: None,
             stash_scroll_enabled: false,
+            restore_clipboard_enabled: false,
+            chat_action_in_flight: Arc::new(AtomicBool::new(false)),
             self_ref: Weak::new(),
         };
         Ok((
@@ -526,6 +610,9 @@ impl Overlay {
             Action::StashSearch { text } => {
                 Self::run_stash_search(overlay, &text).await;
             }
+            Action::PasteInChat { text, send } => {
+                Self::run_paste_in_chat(overlay, &text, send).await;
+            }
         }
     }
 
@@ -562,9 +649,13 @@ impl Overlay {
     /// upstream's uiohook-based one) shouldn't itself produce duplicate
     /// fires, as cheap insurance either way.
     async fn run_copy_item(overlay: &Arc<TokioMutex<Overlay>>, target: &str, focus_overlay: bool) {
-        let (copy_item, mods_key) = {
+        let (copy_item, mods_key, restore_enabled) = {
             let guard = overlay.lock().await;
-            (guard.copy_item.clone(), guard.game_config.show_mods_key())
+            (
+                guard.copy_item.clone(),
+                guard.game_config.show_mods_key(),
+                guard.restore_clipboard_enabled,
+            )
         };
         let mut state = copy_item.lock().await;
 
@@ -592,6 +683,23 @@ impl Overlay {
         };
         let xwayland = game.xwayland;
 
+        // `readItemText`'s `textBefore` capture (`HostClipboard.ts`) —
+        // grabbed before we clobber the clipboard with the copy-item
+        // trigger, restored below regardless of whether item text was
+        // actually found, matching upstream's own both-paths behavior.
+        // Unlike upstream, this doesn't need the KDE/Proton-10
+        // "force-empty-first" workaround: that exists to protect a
+        // *polling* read from mistaking a stale clipboard value for a
+        // fresh copy, and this fork's native-Wayland read is event-driven
+        // (a genuinely fresh `Selection` event per copy, see
+        // `clipboard.rs`'s module docs) — nothing here can confuse "old
+        // value" with "new value" the way polling could.
+        let previous = if restore_enabled {
+            clipboard::current_text(xwayland).await
+        } else {
+            None
+        };
+
         clipboard::drain_stale(&mut state.clipboard_rx);
         if let Err(err) = state.keyboard.copy_item(mods_key).await {
             eprintln!("ee2-hyprland: copy-item: injection failed: {err}");
@@ -606,6 +714,12 @@ impl Overlay {
 
         state.check_in_flight = false;
         drop(state); // release copy_item before touching Overlay's own lock again
+
+        if let Some(previous) = previous {
+            if let Err(err) = clipboard::write_text(&previous, xwayland).await {
+                eprintln!("ee2-hyprland: copy-item: failed to restore clipboard: {err}");
+            }
+        }
 
         let Some(text) = text else {
             eprintln!("ee2-hyprland: copy-item: no item text within timeout (xwayland={xwayland})");
@@ -680,11 +794,20 @@ impl Overlay {
     /// so a short delay follows before injecting — not otherwise guarded
     /// against here.
     async fn run_stash_search(overlay: &Arc<TokioMutex<Overlay>>, text: &str) {
-        let copy_item = {
+        let (copy_item, restore_enabled, in_flight) = {
             let mut guard = overlay.lock().await;
             guard.set_interactive(false);
-            guard.copy_item.clone()
+            (
+                guard.copy_item.clone(),
+                guard.restore_clipboard_enabled,
+                guard.chat_action_in_flight.clone(),
+            )
         };
+
+        if !Self::try_begin_chat_action(&in_flight) {
+            eprintln!("ee2-hyprland: stash-search: previous chat action still settling, ignoring");
+            return;
+        }
 
         // Give the passthrough switch above time to actually land (GTK
         // main-thread marshal, not synchronous with the call above) before
@@ -712,31 +835,175 @@ impl Overlay {
         // named turned out not to exist for this kind of surface.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let clients = match compositor::clients().await {
-            Ok(clients) => clients,
-            Err(err) => {
-                eprintln!("ee2-hyprland: stash-search: failed to query clients: {err}");
-                return;
+        let settled = async {
+            let clients = match compositor::clients().await {
+                Ok(clients) => clients,
+                Err(err) => {
+                    eprintln!("ee2-hyprland: stash-search: failed to query clients: {err}");
+                    return None;
+                }
+            };
+            let Some(game) = compositor::find_game(&clients) else {
+                eprintln!(
+                    "ee2-hyprland: stash-search: game window ({}) not found",
+                    compositor::game_class()
+                );
+                return None;
+            };
+            let xwayland = game.xwayland;
+
+            let previous = if restore_enabled {
+                clipboard::current_text(xwayland).await
+            } else {
+                None
+            };
+            let settled_rx = match clipboard::write_text_restoring(text, xwayland, previous).await {
+                Ok(rx) => rx,
+                Err(err) => {
+                    eprintln!("ee2-hyprland: stash-search: failed to write clipboard: {err}");
+                    return None;
+                }
+            };
+
+            let mut state = copy_item.lock().await;
+            if let Err(err) = state.keyboard.stash_search().await {
+                eprintln!("ee2-hyprland: stash-search: injection failed: {err}");
             }
-        };
-        let Some(game) = compositor::find_game(&clients) else {
-            eprintln!(
-                "ee2-hyprland: stash-search: game window ({}) not found",
-                compositor::game_class()
-            );
-            return;
-        };
-        let xwayland = game.xwayland;
+            drop(state);
+            Some(settled_rx)
+        }
+        .await;
 
-        if let Err(err) = clipboard::write_text(text, xwayland).await {
-            eprintln!("ee2-hyprland: stash-search: failed to write clipboard: {err}");
+        Self::release_chat_action_after(in_flight, settled);
+    }
+
+    /// Ports `text-box.ts::typeInChat()`: writes the (placeholder-stripped)
+    /// text to the clipboard the game will paste from, opens the chat box
+    /// with the right key sequence for which `@last` form (if any) was
+    /// used (`classify_chat_paste`), pastes, and optionally sends. Shares
+    /// `chat_action_in_flight`/`restoreClipboard` handling with
+    /// `run_stash_search` — see that function's docs, and
+    /// `clipboard::write_text_restoring`'s (`RESTORE_AFTER`'s docs
+    /// specifically) for why the restore/throttle-release mechanism both
+    /// funnel through is a fixed wait rather than event-driven.
+    ///
+    /// Unlike `run_stash_search`, this does **not** call
+    /// `set_interactive(false)` first — upstream's `typeInChat` has no
+    /// equivalent `assertGameActive()` call either, since paste-in-chat is
+    /// only ever reachable via a hotkey (fired while the game already has
+    /// focus, `hotkeys_active` gates that), never a click on a button
+    /// inside the overlay the way stash-search's WS path is.
+    async fn run_paste_in_chat(overlay: &Arc<TokioMutex<Overlay>>, text: &str, send: bool) {
+        let (copy_item, restore_enabled, in_flight) = {
+            let guard = overlay.lock().await;
+            (
+                guard.copy_item.clone(),
+                guard.restore_clipboard_enabled,
+                guard.chat_action_in_flight.clone(),
+            )
+        };
+
+        if !Self::try_begin_chat_action(&in_flight) {
+            eprintln!("ee2-hyprland: paste-in-chat: previous chat action still settling, ignoring");
             return;
         }
 
-        let mut state = copy_item.lock().await;
-        if let Err(err) = state.keyboard.stash_search().await {
-            eprintln!("ee2-hyprland: stash-search: injection failed: {err}");
+        let settled = async {
+            let clients = match compositor::clients().await {
+                Ok(clients) => clients,
+                Err(err) => {
+                    eprintln!("ee2-hyprland: paste-in-chat: failed to query clients: {err}");
+                    return None;
+                }
+            };
+            let Some(game) = compositor::find_game(&clients) else {
+                eprintln!(
+                    "ee2-hyprland: paste-in-chat: game window ({}) not found",
+                    compositor::game_class()
+                );
+                return None;
+            };
+            let xwayland = game.xwayland;
+
+            let (clip_text, kind) = classify_chat_paste(text);
+
+            let previous = if restore_enabled {
+                clipboard::current_text(xwayland).await
+            } else {
+                None
+            };
+            let settled_rx =
+                match clipboard::write_text_restoring(&clip_text, xwayland, previous).await {
+                    Ok(rx) => rx,
+                    Err(err) => {
+                        eprintln!("ee2-hyprland: paste-in-chat: failed to write clipboard: {err}");
+                        return None;
+                    }
+                };
+
+            let mut state = copy_item.lock().await;
+            let inject_result: io::Result<()> = async {
+                match kind {
+                    ChatPasteKind::ReplyToLast => state.keyboard.open_chat_reply_to_last().await?,
+                    ChatPasteKind::ReplyToLastTrailing => {
+                        state.keyboard.open_chat_reply_to_last().await?;
+                        state.keyboard.chat_move_home_twice_and_delete().await?;
+                    }
+                    ChatPasteKind::Plain(select_existing) => {
+                        state.keyboard.open_chat(select_existing).await?;
+                    }
+                }
+                state.keyboard.paste_clipboard().await?;
+                if send {
+                    state.keyboard.send_chat_message().await?;
+                    // Deliberately NOT porting upstream's restore-last-chat
+                    // tail here (`Enter, Enter, ArrowUp, ArrowUp, Escape`,
+                    // `text-box.ts`) — the KDE fork found this leaves
+                    // PoE2's own chat box open on Proton/Wayland instead of
+                    // closing it, causing a second send and opening the
+                    // game's own menu. Needs live verification against this
+                    // system's own PoE2 before any tail is added back — see
+                    // PLAN.md's paste-in-chat entry for what was actually
+                    // observed.
+                }
+                Ok(())
+            }
+            .await;
+            drop(state);
+
+            if let Err(err) = inject_result {
+                eprintln!("ee2-hyprland: paste-in-chat: injection failed: {err}");
+            }
+            Some(settled_rx)
         }
+        .await;
+
+        Self::release_chat_action_after(in_flight, settled);
+    }
+
+    /// Ports `HostClipboard.isRestored`'s throttle check: `false` (already
+    /// in flight) means the caller should drop this call entirely, same as
+    /// upstream's `restoreShortly` early-return — "not only do we not
+    /// overwrite clipboard, but we don't exec callback either".
+    fn try_begin_chat_action(flag: &Arc<AtomicBool>) -> bool {
+        flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Clears `chat_action_in_flight` once `settled` resolves (or
+    /// immediately, if the action never got far enough to produce a settle
+    /// handle at all) — spawned so `run_stash_search`/`run_paste_in_chat`
+    /// don't have to block their own caller on this.
+    fn release_chat_action_after(
+        in_flight: Arc<AtomicBool>,
+        settled: Option<oneshot::Receiver<()>>,
+    ) {
+        tokio::spawn(async move {
+            if let Some(rx) = settled {
+                let _ = rx.await;
+            }
+            in_flight.store(false, Ordering::SeqCst);
+        });
     }
 
     /// The big dispatcher for everything arriving over WS `/events`. Ports
@@ -792,10 +1059,46 @@ impl Overlay {
                     .get("stashScroll")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+
+                self.restore_clipboard_enabled = payload
+                    .get("restoreClipboard")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
             }
             "CLIENT->MAIN::user-action" => {
                 match payload.get("action").and_then(Value::as_str) {
                     Some("quit") => std::process::exit(0),
+                    Some("check-for-update") => {
+                        // No self-update mechanism in this fork (packaged
+                        // and updated like any other native Linux
+                        // package — PLAN.md's packaging stage — not an
+                        // installer with its own updater) — respond the
+                        // same shape `/config`'s own initial `updater`
+                        // value already uses (`server.rs::get_config`), so
+                        // Settings' About screen resolves the "Checking…"
+                        // state it optimistically shows on click into a
+                        // definitive one instead of hanging there forever.
+                        let checked_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        self.broadcast(json!({
+                            "name": "MAIN->CLIENT::updater-state",
+                            "payload": {"state": "update-not-available", "checkedAt": checked_at},
+                        }));
+                    }
+                    Some("update-and-restart") => {
+                        // Unreachable in practice: the About screen only
+                        // shows the button that sends this when a prior
+                        // `updater-state` reported `update-downloaded`,
+                        // which this fork never sends (see
+                        // `check-for-update` above) — logged rather than
+                        // silently ignored in case that assumption ever
+                        // breaks.
+                        eprintln!(
+                            "ee2-hyprland: update-and-restart requested but this fork has no self-update mechanism, ignoring"
+                        );
+                    }
                     Some("stash-search") => {
                         let Some(text) = payload.get("text").and_then(Value::as_str) else {
                             eprintln!(
