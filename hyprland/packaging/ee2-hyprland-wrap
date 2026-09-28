@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Ties the ee2-hyprland overlay's lifecycle to the game process it's meant
+# to sit alongside: start the systemd --user service, run the wrapped
+# command (the game, via Steam's %command% substitution), and stop the
+# service once that command exits — however it exits.
+#
+# Steam launch options (PoE2):
+#     ee2-hyprland-wrap %command%
+#
+# No wait-for-the-game's-window step here, unlike an earlier prototype's
+# wrapper (~/ee2-hypr/packaging/ee2-hypr-wrap, hyprctl-clients polling once
+# a second until the game's window class appeared, only then starting the
+# overlay). That existed to solve a real problem in that prototype: an
+# overlay window that's already mapped when the game's window appears sits
+# on whatever monitor happened to be focused at overlay-start time, not
+# necessarily the game's monitor.
+#
+# This fork's overlay doesn't have that problem: the layer-shell surface is
+# fully unmapped (`window.set_visible(false)`, hyprland/src/overlay/window.rs)
+# whenever nothing needs to be shown, and unmapping/remapping a GTK toplevel
+# destroys and recreates its underlying Wayland surface — so every time the
+# overlay becomes visible again, Hyprland is choosing its monitor fresh, not
+# reusing a placement decision from whenever the surface first appeared. And
+# the overlay only ever becomes visible in response to a hotkey or hover
+# action, both gated on the game actually being the focused window
+# (`hotkeys.rs`'s `game_active` gate) — so by the time any surface is ever
+# mapped, the game already has focus and Hyprland's layer-shell placement
+# naturally lands on the game's own monitor. No polling needed either way:
+# starting the service here just makes sure it's up by the time the game
+# might want it, same as the prototype's separate host service did.
+set -uo pipefail
+
+cleanup() {
+    systemctl --user stop ee2-hyprland.service 2>/dev/null
+}
+# EXIT alone would already cover INT/TERM (bash still runs the EXIT trap
+# after a caught signal ends the script), but naming them keeps the intent
+# readable and matches the prototype this was ported from.
+trap cleanup EXIT INT TERM
+
+systemctl --user start ee2-hyprland.service
+
+# Not `exec "$@"`: that would replace this script's own process with the
+# game, so the EXIT trap above would never run when the game itself exits —
+# nothing would be left to stop the service. Running it as an ordinary
+# foreground command keeps this script alive (as the game's parent) until
+# the game exits, whatever the exit reason.
+"$@"

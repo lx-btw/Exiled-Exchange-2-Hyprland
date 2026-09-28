@@ -1,0 +1,124 @@
+# Maintainer: aleksey <zheahasyun@gazeta.pl>
+#
+# Builds directly from this private repo's own working tree — no source
+# array, no VCS fetch, no tarball. This file only makes sense run from
+# inside the checkout it lives in (hyprland/packaging/PKGBUILD); it is not
+# meant to be relocated or published standalone. Stage 6a, PLAN.md: local
+# packaging only — CI, a README for outside users, and any kind of
+# publication are explicitly a later, separate stage.
+pkgname=ee2-hyprland
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Hyprland-native price-check overlay for Path of Exile 2 (Exiled Exchange 2 fork)"
+arch=('x86_64')
+url="https://github.com/Kvan7/Exiled-Exchange-2"
+license=('MIT')
+
+# !debug, !lto: this machine's /etc/makepkg.conf has both `debug` and `lto`
+# enabled globally, which (for `debug`) exports RUSTFLAGS with a
+# --remap-path-prefix argument for the whole build() step. Reproduced live
+# (2026-09-28): that RUSTFLAGS value is the *only* Rust/Cargo-relevant
+# difference between a plain `cargo build --release --locked` in this same
+# checkout (succeeds) and running the identical command through makepkg's
+# build() (fails every time) — confirmed by diffing `env` captured from
+# both. Setting any RUSTFLAGS at all invalidates Cargo's fingerprint cache
+# for every crate (full rebuild, not just this package), and somewhere in
+# that combination — full-cache-miss rebuild + this crate's own
+# `lto = true` release profile + makepkg's own `-flto=auto` folded into
+# CFLAGS/LDFLAGS + the remap flag — the final link step reliably drops the
+# `-l` for aws-lc-sys's compiled static crypto lib (`libaws_lc_0_45_0_crypto.a`)
+# while still emitting its `-L` search path and the object code that
+# references its symbols, so linking fails with "undefined symbol:
+# aws_lc_0_45_0_*" for every symbol that library provides. Not something
+# this package needs anyway: Arch's separate `-debug` split package (what
+# `debug` produces) and system-wide LTO'd hardening for a from-source C
+# toolchain (what `lto` does to CFLAGS/LDFLAGS) are both meant for
+# distro-published packages, not a local install of a private repo's own
+# checkout.
+options=('!debug' '!lto')
+
+# The set `ldd target/release/ee2-hyprland` actually reports (checked
+# 2026-09-28 against a real release build on this machine) is much larger
+# than this — libcairo, libpango, libwebp/libavif/libjxl, the GStreamer
+# lib*-1.0 set, ICU, libsoup3, etc. None of those are listed here: they're
+# all pulled in transitively by pacman through gtk4's and webkitgtk-6.0's
+# own `depends=`, so naming them again here would just be redundant, not
+# more correct. Re-run `ldd` after any dependency bump and diff against
+# `pacman -Qi gtk4 gtk4-layer-shell webkitgtk-6.0` if that assumption ever
+# needs rechecking.
+depends=(
+  'gtk4'
+  'gtk4-layer-shell'
+  'webkitgtk-6.0'
+)
+# wl-clipboard is deliberately NOT here. clipboard.rs's native-Wayland path
+# owns its own zwlr_data_control_source_v1 for writes (Phase C, PLAN.md)
+# and reads wlr-data-control events directly — no wl-copy/wl-paste
+# subprocess anywhere in production code, only in that module's own
+# #[cfg(test)] tests (which verify against a real wl-paste independently
+# of what write_text itself does). Re-verify with:
+#   grep -n 'wl-copy\|wl-paste' hyprland/src/clipboard.rs
+# before ever adding it back — every hit outside `mod tests` should be a
+# comment, not a live Command::new.
+optdepends=(
+  "xsel: reading the game's clipboard selection when it runs under XWayland (clipboard.rs's xwayland path)"
+)
+makedepends=(
+  'nodejs'
+  'npm'
+  'rust'
+)
+
+# Neither /dev/uinput (input/inject.rs's virtual keyboard, read+write) nor
+# /dev/input/event* (hotkeys.rs's evdev listener, read) get a udev rule
+# from this package — see README.md in this directory for the reasoning
+# (short version: a package silently dropping a udev rule is the same kind
+# of unrequested system-wide side effect CLAUDE.md's fork-boundary section
+# rules out for Hyprland's own config, and the same principle applies here).
+# If access is missing the binary says so at startup rather than failing
+# silently: hotkeys.rs logs "no keyboard-like /dev/input device found" if
+# evdev enumeration opened nothing, and main.rs aborts startup printing
+# whatever io::Error VirtualKeyboard::new() hit opening /dev/uinput
+# (typically "Permission denied (os error 13)") — check
+# `journalctl --user -u ee2-hyprland -b` if the overlay never appears.
+
+_repo_root="$startdir/../.."
+
+prepare() {
+  cd "$_repo_root/renderer"
+  npm ci
+  # CLAUDE.md: "must run before dev/build — generates data-driven assets".
+  npm run make-index-files
+}
+
+build() {
+  cd "$_repo_root/renderer"
+  npm run build
+
+  cd "$_repo_root/hyprland"
+  cargo build --release --locked
+}
+
+package() {
+  install -Dm755 "$_repo_root/hyprland/target/release/ee2-hyprland" \
+    "$pkgdir/usr/bin/ee2-hyprland"
+  install -Dm755 "$startdir/ee2-hyprland-wrap" \
+    "$pkgdir/usr/bin/ee2-hyprland-wrap"
+
+  install -Dm644 "$startdir/ee2-hyprland.service" \
+    "$pkgdir/usr/lib/systemd/user/ee2-hyprland.service"
+
+  install -Dm644 "$startdir/ee2-hyprland.desktop" \
+    "$pkgdir/usr/share/applications/ee2-hyprland.desktop"
+
+  # main/build/icons/ is upstream's own electron-builder icon set — reading
+  # one of its files here is not "patching main/" (CLAUDE.md's fork
+  # boundary is about never *editing* main/renderer/ipc/dataParser, not
+  # about never reading an asset out of them). Repo root LICENSE (MIT)
+  # covers it same as everything else in the tree.
+  install -Dm644 "$_repo_root/main/build/icons/512x512.png" \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/ee2-hyprland.png"
+
+  install -Dm644 "$_repo_root/LICENSE" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
