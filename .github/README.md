@@ -20,13 +20,11 @@ upstream's do.
 | Overlay window | `electron-overlay-window` (X11 attach) | GTK4 + gtk4-layer-shell surface hosting a WebKitGTK 6 WebView |
 | Hotkeys | Electron `globalShortcut` (`XGrabKey`) | evdev; keyboards are grabbed (`EVIOCGRAB`) only while the game is focused, unmatched keys re-emitted through a uinput mirror |
 | Key injection (item copy, chat, stash search) | `uiohook-napi` (XTEST) | uinput virtual keyboard |
-| Clipboard | Chromium's X11 clipboard | wlr-data-control, event-driven (`xsel` only for a game running under Xwayland) |
+| Clipboard | Chromium's X11 clipboard | wlr-data-control, event-driven |
 | Game window / monitor state | X11 | Hyprland IPC sockets (`.socket.sock`, `.socket2.sock`) |
 | Tray | Electron `Tray` | StatusNotifierItem via `ksni` |
 
-The app never edits or binds anything in Hyprland's config — no binds, no window or
-layer rules, no `hyprctl keyword`. Your own key combos keep working in other
-applications. The rationale for every design decision is in
+The rationale for every design decision is in
 [`hyprland/HYPRLAND-NOTES.md`](../hyprland/HYPRLAND-NOTES.md).
 
 ## Install
@@ -53,8 +51,7 @@ The PKGBUILD builds from the checkout's working tree (no `source=()` array): it 
 the renderer build (`npm ci`, `npm run make-index-files`, `npm run build`) and then
 `cargo build --release --locked`. Build dependencies: `nodejs`, `npm`, `rust`.
 
-Runtime dependencies: `gtk4`, `gtk4-layer-shell`, `webkitgtk-6.0`; optional `xsel`
-(only for a game running under Xwayland).
+Runtime dependencies: `gtk4`, `gtk4-layer-shell`, `webkitgtk-6.0`.
 
 ### Device access
 
@@ -70,12 +67,8 @@ example rules: [`hyprland/packaging/README.md`](../hyprland/packaging/README.md)
 
 ### Running
 
-- Run the game as a native Wayland client. Steam launch options:
-  `PROTON_ENABLE_WAYLAND=1 %command%` (the Xwayland clipboard path exists but is
-  untested against a real game).
-- Start the overlay from the "Exiled Exchange 2 (Hyprland)" desktop entry, or with
-  `systemctl --user start ee2-hyprland`. The service is deliberately not enabled at
-  login.
+- The game must run as a native Wayland client. Steam launch options:
+  `PROTON_ENABLE_WAYLAND=1 %command%`. Under Xwayland the overlay doesn't work.
 - Optionally tie it to the game instead: `PROTON_ENABLE_WAYLAND=1 ee2-hyprland-wrap %command%`
   starts the service before the game and stops it when the game exits.
 - Logs: `journalctl --user -u ee2-hyprland -b`.
@@ -91,14 +84,13 @@ matter:
 
 - `price-check.builtinBrowser` is unsupported; trade links open in the system browser.
   Keep that setting off.
-- OCR / heist-gem features are not available (Windows-only upstream).
 - Input devices plugged in after startup are not picked up until the overlay restarts.
 - Caps Lock / Num Lock LEDs don't update while the game is focused (the lock state
   itself is correct).
 - Hotkeys can use letters, digits, F-keys and common named keys; no numpad/media keys,
   and a bare modifier can't be a hotkey.
-- The Xwayland clipboard path (game without `PROTON_ENABLE_WAYLAND=1`) has never been
-  tested against a real game.
+- The game must run under native Wayland (`PROTON_ENABLE_WAYLAND=1`); under Xwayland
+  the overlay doesn't work.
 - A foreign layer-shell client taking the keyboard (e.g. rofi) while the overlay is
   interactive is not detected as focus loss.
 - No self-updater: updates come from installing a newer package.
