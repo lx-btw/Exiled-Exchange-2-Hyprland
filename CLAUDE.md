@@ -6,153 +6,132 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A private fork of [Kvan7/Exiled-Exchange-2](https://github.com/Kvan7/Exiled-Exchange-2)
 (a PoE2 price-check overlay, itself forked from Awakened PoE Trade). Upstream targets
-Windows/X11 via Electron. This fork adds a native Hyprland/Wayland platform layer.
+Windows/X11 via Electron. This fork adds a native Hyprland/Wayland platform layer in
+`hyprland/` that replaces Electron's `main/` entirely.
 
-**The fork boundary is absolute and load-bearing — read this before touching anything:**
+The fork is feature-complete and live-verified; it is in **maintenance mode** (small
+bug fixes, pulling upstream updates, Stage 6b CI/README work). Status, known
+limitations and the maintenance procedures (pulling upstream, bug triage) are in
+`PLAN.md`. Design rationale for every module: `hyprland/HYPRLAND-NOTES.md`.
 
-- `main/`, `renderer/`, `ipc/`, `dataParser/`, `docs/` are upstream. **Never patch them.**
-  Not a one-line fix, not a config tweak. They must stay byte-for-byte mergeable with
-  `git merge upstream/master` on the `master` branch at all times.
-- `hyprland/` is the only directory this fork ever writes to. It's a from-scratch Rust
-  platform layer (GTK4 + `gtk4-layer-shell` + WebKit6 + evdev/uinput) that replaces
-  Electron's `main/` entirely, talking to the unmodified `renderer/` over the same
-  HTTP+WebSocket protocol upstream's Electron host uses (`ipc/types.ts` is the contract —
-  see below).
-- Branches: `master` mirrors `upstream/master` exactly (fast-forward only, never commit
-  here). `hyprland` carries all our code, rebased/merged from `master` as upstream moves.
-  Remote `upstream` has push disabled on purpose (`git remote set-url --push upstream DISABLE`)
-  — it is fetch-only, treat a push failure there as a sign something is misconfigured,
-  not an obstacle to route around.
+## Fork boundary — absolute and load-bearing, read before touching anything
 
-Full rationale, the platform-layer design, and why each upstream approach (Electron
-`globalShortcut`+XTEST, KWin/KDE's DBus-bridge approach) doesn't work on Hyprland:
-`hyprland/HYPRLAND-NOTES.md`. Implementation plan and progress: `PLAN.md`.
+- `main/`, `renderer/`, `ipc/`, `dataParser/`, `docs/` are upstream. **Never patch
+  them.** Not a one-line fix, not a config tweak. They must stay byte-for-byte
+  mergeable with `upstream/master` at all times.
+- `hyprland/` is the only directory with fork code (plus the root `CLAUDE.md`,
+  `PLAN.md`). It talks to the unmodified `renderer/` over the same HTTP+WebSocket
+  protocol upstream's Electron host uses; `ipc/types.ts` is the contract.
+- Branches: `master` mirrors `upstream/master` exactly (fast-forward only, never
+  commit there). `hyprland` carries all fork code and merges `master` as upstream
+  moves. Remote `upstream` has push disabled on purpose (`git remote set-url --push
+  upstream DISABLE`) — fetch-only; a push failure there means something is
+  misconfigured, not an obstacle to route around.
+- **Input rule: the app never edits or binds anything in Hyprland's config** — no
+  `bind`, no window/layer rules, no `keyword`, no `hyprctl keyword`/`eval`/`dispatch`
+  that changes compositor state. (A prior prototype's config binds broke the same
+  key combos in other applications system-wide — the problem this fork exists to
+  fix.) **evdev `EVIOCGRAB` capture is allowed**, scoped to game focus: only real
+  physical keyboards (never our own uinput devices, never the mouse), only while
+  PoE2 is the focused window, transitions only when nothing is held on that device,
+  and everything except a matched hotkey's own trigger key is re-emitted through a
+  uinput mirror device. See `input/hotkeys.rs` / `input/grab.rs`, HYPRLAND-NOTES.md
+  §3.
+- Key injection goes through our own uinput virtual keyboard (US layout). XTEST and
+  `hl.dsp.send_shortcut` are known-broken on Hyprland for this — do not reintroduce
+  either.
+- No installer side effects: no udev rules, no autostart; the package only installs
+  files.
+
+Easy-to-undo decisions (rationale in HYPRLAND-NOTES.md): layer-shell keyboard mode is
+only ever `None`/`Exclusive`, never `OnDemand` (follow_mouse would hand focus back to
+the game); the clipboard is read from whichever selection the game owns (`xwayland`
+flag), never "the convenient one"; the WebView runs with
+`HardwareAccelerationPolicy::Never` (otherwise it stops rendering after the first
+hide/show); the window's transparent-background `CssProvider` must stay.
+
+## `hyprland/` module map (`hyprland/src/`)
+
+- `main.rs` — wiring: GTK on the main thread, tokio runtime on a background thread.
+  Ordering warning there: the uinput virtual keyboard must exist before hotkey
+  watching starts.
+- `state.rs` — the state machine (`Overlay`): price-check / stash-search /
+  paste-in-chat flows, interactive vs passthrough, surface visibility, keyboard
+  mode, WS event dispatcher (`handle_ws_event`). Ports `OverlayWindow.ts` and the
+  action handlers of `Shortcuts.ts`/`text-box.ts`.
+- `server.rs` — axum HTTP + WS server implementing `ipc/types.ts` (`/`, `/config`,
+  `/proxy/<url>`, WS `/events`); embeds `renderer/dist` via `rust-embed`.
+- `proxy.rs` — trade-API relay with its own cookie jar (`proxy.ts`).
+- `compositor.rs` — Hyprland IPC over `.socket.sock`/`.socket2.sock` (focus, clients,
+  monitors, cursor, devices, `switchxkblayout`); no `hyprctl` subprocesses.
+- `input/hotkeys.rs` — evdev hotkey matcher and capture driver; `input/grab.rs` —
+  `EVIOCGRAB` bookkeeping, mirror uinput device, per-device XKB layout sync;
+  `input/inject.rs` — uinput virtual keyboard (copy-item, stash-search, chat,
+  stash-scroll); `input/keymap.rs` — shortcut string ↔ evdev keycode.
+- `area_tracker.rs` — hover/click tracking for the price-check widget
+  (`WidgetAreaTracker.ts`) and Ctrl+wheel `stashScroll`, read-only mouse devices.
+- `clipboard.rs` — wlr-data-control read (event-driven) and write (own data
+  source), `restoreClipboard`; `xsel` for an Xwayland game.
+- `overlay/window.rs` — GTK4 + gtk4-layer-shell surface (layer, input region,
+  keyboard mode, monitor, visibility); `overlay/webview.rs` — WebKit6 WebView
+  (Electron UA substring, focus/hover bridges, `window.open`, acceleration off).
+- `config.rs` — upstream `config.json` (`ConfigStore.ts`) and
+  `poe2_production_Config.ini` `showModsKey` (`GameConfig.ts`).
+- `game_log.rs` — inotify `Client.txt` tail → `game-log` (`GameLogWatcher.ts`).
+- `file_writer.rs` — `write-data` sink (`FileWriter.ts`).
+- `logger.rs` — `ee_log!`: stderr + in-memory history + `log-entry` (`RemoteLogger.ts`).
+- `tray.rs` — StatusNotifierItem via `ksni` (`AppTray.ts`).
+- `hyprland/packaging/` — PKGBUILD, systemd user unit, `ee2-hyprland-wrap` (Steam
+  launch wrapper), `.desktop`, `README.md` (device access).
 
 ## Commands
 
-### Upstream (`main/`, `renderer/`) — only touch when syncing from upstream
-
 ```shell
-# renderer (Vue3 UI, runs inside the WebView we provide)
+# renderer (upstream Vue app) — the binary embeds renderer/dist at compile time,
+# so build it before cargo (and after every upstream sync)
 cd renderer
-npm install
-npm run make-index-files   # must run before dev/build — generates data-driven assets
-npm run dev                # vite dev server
-npm run build               # vue-tsc --noEmit && vite build  → renderer/dist
-npm run check-types
-npm run lint / lint-fix
-npm run test                 # vitest
-npm run format
+npm ci
+npm run make-index-files   # must run before build — generates data-driven assets
+npm run build              # vue-tsc --noEmit && vite build → renderer/dist
 
-# main (Electron host) — reference only; this fork does not build or run this
-cd main
-npm install
-npm run dev                  # node build/script.mjs
-npm run build                # tsc --noEmit && node build/script.mjs --prod
-npm run check-types
-npm run lint / fix
-```
-
-`renderer/dist` is the only upstream build artifact this fork consumes — it gets
-embedded into the Rust binary via `rust-embed`. `main/` is kept in the tree only so
-`main/src/*.ts` remains readable as a porting reference; it is never built here.
-
-### This fork (`hyprland/`)
-
-```shell
+# fork
 cd hyprland
-cargo build
 cargo build --release
-cargo run -- <command>        # see hyprland/src/main.rs for the command list
-cargo test
-cargo clippy
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+cargo test                 # clipboard tests use the live Hyprland session + wl-paste
+
+# package (the user installs it: sudo pacman -U ee2-hyprland-*.pkg.tar.zst)
+cd hyprland/packaging
+makepkg -f
 ```
 
-There is no CI/build pipeline wired up yet (Stage 6 in `PLAN.md`). Until then, building
-and running is manual.
+Don't run `sudo`/`pacman` yourself; installing is the user's step. `main/` is never
+built here — it's kept only as a porting reference (`main/src/*.ts`).
 
-## Architecture
+## Runtime and debugging
 
-### Upstream protocol boundary (do not change without checking `ipc/types.ts`)
+- Logs: `journalctl --user -u ee2-hyprland -b` (all lines prefixed `ee2-hyprland:`,
+  renderer console output included). PLAN.md's bug-triage section lists the lines
+  that matter (`set_interactive(...)`, `game focus`, `surface:`, `capture:`,
+  `copy-item:` …).
+- Single instance: a second launch only activates the already-running
+  `GApplication`. Stop the service (`systemctl --user stop ee2-hyprland`) or kill
+  the exact PID before testing a new build.
+- Proxy: the shell exports `HTTP(S)_PROXY` without `NO_PROXY`. Run a build manually
+  with `NO_PROXY=127.0.0.1,localhost ./target/release/ee2-hyprland` (otherwise the
+  WebView can't load its own loopback assets); `curl` to it needs `--noproxy '*'`.
+  `cargo test` works as-is.
+- `EE2_GAME_CLASS=<class>` points "the game" at another window for testing without
+  PoE2 (default `pathofexilesteam.exe`).
+- Surface/rendering problems: `WAYLAND_DEBUG=1`; HYPRLAND-NOTES.md §9.
+
+## Upstream protocol boundary
 
 `ipc/types.ts` and `ipc/KeyToCode.ts` define the entire wire contract between the
-Electron/our-Rust host and the `renderer/` UI: an HTTP surface (`/`, `/config`,
-`/proxy/<url>`) plus a WebSocket at `/events` carrying named JSON events
-(`MAIN->OVERLAY::focus-change`, `CLIENT->MAIN::save-config`, `OVERLAY->MAIN::focus-game`,
-etc.). This is the seam the whole fork is built on: as long as `hyprland/` speaks this
-protocol correctly, `renderer/` needs zero modification, ever. When upstream changes
-`ipc/types.ts`, that diff is the complete list of what `hyprland/src/server.rs` needs
-to catch up on — check it first on every sync from upstream.
-
-### Upstream's own structure (for porting reference, in `main/src/`)
-
-- `windowing/OverlayWindow.ts` — overlay show/hide/interactive state machine. Ported
-  to `hyprland/src/state.rs` + `hyprland/src/overlay/`.
-- `windowing/GameWindow.ts` — game window attach/focus/geometry via `electron-overlay-window`
-  (X11-only). Replaced by `hyprland/src/compositor.rs` talking to Hyprland's own IPC
-  sockets directly.
-- `shortcuts/Shortcuts.ts` — hotkey registration (`globalShortcut`) and dispatch
-  (`copy-item`, `paste-in-chat`, `stash-search`, `trigger-event`, `toggle-overlay`,
-  `stashScroll`). Ported to `hyprland/src/input/hotkeys.rs`, reading the same
-  `config.json` shortcut definitions but dispatched from evdev instead of Electron's
-  global-shortcut API — no compositor-level keybind is ever registered.
-- `shortcuts/HostClipboard.ts` — clipboard polling via Electron's Chromium clipboard
-  (X11-only, and racy on Wayland — see `HYPRLAND-NOTES.md`). Replaced by
-  `hyprland/src/clipboard.rs`, event-driven via `wlr-data-control`.
-- `shortcuts/text-box.ts` — chat-typing / stash-search key sequences via `uiohook`
-  XTEST. Replaced by `hyprland/src/input/inject.rs`, via our own `uinput` virtual
-  keyboard.
-- `host-files/GameConfig.ts` — reads `poe2_production_Config.ini` for user keybinds
-  (e.g. `show_advanced_item_descriptions` / `showModsKey`). Not yet ported — see
-  `PLAN.md` Stage 5.
-- `host-files/GameLogWatcher.ts` — tails the PoE2 client log (chat, zone changes).
-  Not yet ported.
-- `server.ts` — the Electron host's HTTP+WS server implementing the `ipc/` protocol.
-  Ported to `hyprland/src/server.rs`.
-- `proxy.ts` — outbound HTTPS relay to trade-site APIs (CORS workaround) with a cookie
-  jar. Ported to `hyprland/src/proxy.rs`.
-- `AppTray.ts` — system tray menu. Ported to `hyprland/src/tray.rs` via `ksni`.
-- `vision/` (OCR for heist gems) — Windows-only upstream already; out of scope here.
-
-### `hyprland/` layout
-
-See `PLAN.md` for the full module breakdown and the crate versions each depends on.
-In short: `compositor.rs` (Hyprland's `.socket.sock`/`.socket2.sock` IPC, no `hyprctl`
-subprocess spawns), `input/` (evdev listen + `EVIOCGRAB` capture + uinput inject/mirror
-— see `input/hotkeys.rs`/`input/grab.rs`; nothing here ever writes to a Hyprland
-keybind config, which is the actual rule, not whether a device gets grabbed), `clipboard.rs`
-(`wlr-data-control`, event-driven), `overlay/` (GTK4 + `gtk4-layer-shell` +
-WebKit6 — layer-shell surfaces sit outside the compositor's window/focus model
-entirely, which is *why* Electron doesn't work here), `server.rs`/`proxy.rs`
-(the `ipc/` protocol implementation), `tray.rs`, `state.rs`.
-
-### Key design decisions worth knowing before changing platform-layer code
-
-- **No Hyprland config is ever touched** — no binds, no window rules, no keywords,
-  no `hyprctl keyword`/`eval`. This is the actual hard requirement, carried over
-  from a prior prototype whose config-bind approach broke the same key combos in
-  other applications system-wide. **It is a rule about the compositor's config, not
-  about evdev** — earlier revisions of this file conflated the two by also banning
-  `EVIOCGRAB`, which was a misreading of the actual constraint corrected 2026-09-24.
-- **Physical keyboards ARE grabbed via `EVIOCGRAB`, deliberately, keyd-style** —
-  see `input/hotkeys.rs`/`input/grab.rs`. Grabbing is scoped to real hardware only
-  (never our own `uinput` devices), active only while the game is focused, and a
-  grab/ungrab transition only happens at a moment nothing is held on that specific
-  device (otherwise deferred to its next release) — this is what stops a modifier
-  from being reported stuck to Hyprland. Whatever a grabbed device produces that
-  isn't the matched hotkey's own trigger-key edge is re-emitted immediately through
-  a second, separate `uinput` mirror device, so the game still receives every other
-  key normally. No timers anywhere in this path — `EVIOCGRAB` is fd-scoped kernel
-  state the kernel releases on any process exit, including `SIGKILL`.
-- **Key injection goes through our own `uinput` virtual device**, advertising a
-  US-only layout — this sidesteps the user's `us,ru` layout-switching setup entirely,
-  since layout switching in Hyprland is per-physical-device. XTEST and
-  `hl.dsp.send_shortcut` are both known-broken on Hyprland for this (desynced
-  modifier state / dropped modifiers) — do not reintroduce either.
-- **Layer-shell keyboard mode must be `EXCLUSIVE`**, never `ON_DEMAND` — at
-  `ON_DEMAND`, `follow_mouse` hands keyboard focus back to the game on the first
-  mouse movement over the overlay.
-- **Clipboard is read from whichever selection the game actually owns** (X11 via
-  Hyprland's per-client `xwayland` flag, or the native Wayland selection) — XWM only
-  mirrors X11↔Wayland selections on ownership change, not content change, so reading
-  the "wrong" side sees stale data on a second copy.
+host and `renderer/`: HTTP (`/`, `/config`, `/proxy/<url>`) plus WebSocket `/events`
+carrying named JSON events (`MAIN->OVERLAY::focus-change`, `CLIENT->MAIN::save-config`,
+`OVERLAY->MAIN::render-state`, …). As long as `hyprland/` speaks this protocol,
+`renderer/` needs zero modification. When upstream changes `ipc/types.ts`, that diff
+is the list of what `server.rs`/`state.rs` must catch up on — check it first on every
+sync (procedure in PLAN.md).
