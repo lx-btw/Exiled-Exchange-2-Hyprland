@@ -82,7 +82,7 @@ fn main() -> gtk4::glib::ExitCode {
             };
             let _ = addr_tx.send(addr);
 
-            tokio::spawn(tray::start(overlay.clone(), format!("http://{addr}/")));
+            tokio::spawn(tray::start(format!("http://{addr}/")));
 
             // Hotkeys: `hotkey_bindings` starts empty and is only ever
             // populated once the renderer pushes real config over WS

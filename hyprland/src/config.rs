@@ -41,6 +41,16 @@ pub fn config_dir() -> PathBuf {
     base.join("exiled-exchange-2").join("apt-data")
 }
 
+/// `overlayKey` from the saved config (renderer default: "Shift + Space").
+pub async fn overlay_key() -> String {
+    ConfigStore::new()
+        .load()
+        .await
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .and_then(|v| v.get("overlayKey")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "Shift + Space".to_string())
+}
+
 /// Tracks the same one quirk upstream's `ConfigStore` has: once a temporary
 /// save happens, every subsequent save (temporary or not) goes to a
 /// `.tmp`-suffixed sibling path instead of the real config file, for the

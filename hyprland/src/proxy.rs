@@ -84,12 +84,18 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new() -> Self {
-        Self {
-            jar: Mutex::new(HashMap::new()),
-            client: reqwest::Client::builder()
+        Self::with_client(
+            reqwest::Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("reqwest client with just a timeout should never fail to build"),
+        )
+    }
+
+    fn with_client(client: reqwest::Client) -> Self {
+        Self {
+            jar: Mutex::new(HashMap::new()),
+            client,
         }
     }
 }
@@ -415,7 +421,16 @@ mod tests {
     #[tokio::test]
     async fn handle_returns_decoded_json_for_a_chunked_gzip_upstream() {
         let addr = spawn_fake_upstream().await;
-        let proxy = Arc::new(Proxy::new());
+        // `no_proxy()`: the fake upstream is on loopback; the user's
+        // HTTP(S)_PROXY must not route this test's request elsewhere. The
+        // production client (`Proxy::new`) keeps honoring those variables.
+        let proxy = Arc::new(Proxy::with_client(
+            reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .no_proxy()
+                .build()
+                .unwrap(),
+        ));
         let host = format!("127.0.0.1:{}", addr.port());
         let uri: axum::http::Uri = format!("/proxy/{host}/api/trade2/data/leagues")
             .parse()
