@@ -451,8 +451,8 @@ to scroll; repainting a long, dense trade-result list was not measured.
 2. Stop the installed instance first (`systemctl --user stop ee2-hyprland`) — the
    app is a single-instance `GApplication`, a second launch just activates the
    running one.
-3. Run it with a trace: `NO_PROXY=127.0.0.1,localhost WAYLAND_DEBUG=1
-   ./target/release/ee2-hyprland 2> /tmp/wl.log`. The overlay is only shown while
+3. Run it with a trace: `WAYLAND_DEBUG=1 ./target/release/ee2-hyprland
+   2> /tmp/wl.log`. The overlay is only shown while
    the game is on screen; either use the game, or point `EE2_GAME_CLASS` at a
    stand-in window's class (`hyprctl clients -j`) and focus it.
 4. Show and hide the overlay at least three times (overlay hotkey, default
@@ -470,7 +470,9 @@ The renderer is served from our own `127.0.0.1:<port>` server. WebKit's network
 stack honors `http_proxy`/`https_proxy` even for loopback when `NO_PROXY` doesn't
 exclude it: every asset request then fails (e.g. 503 from a local proxy), the
 renderer never mounts, and it looks like a rendering failure rather than a network
-one. The systemd unit therefore sets
-`NO_PROXY=127.0.0.1,localhost` (both spellings); a manual run from a shell with
-proxy variables needs the same. Outbound trade-site requests in `proxy.rs` still
-use the proxy, as intended.
+one. The binary therefore appends `127.0.0.1` and `localhost` to `NO_PROXY` and
+`no_proxy` first thing in `main()` (`exempt_loopback_from_proxy`; existing entries
+are kept), before any thread exists — `set_var` isn't safe once other threads may
+read the environment. That covers a manual run and any launcher without the unit
+(e.g. an AppImage); the systemd unit sets the same values too, as belt-and-braces.
+Outbound trade-site requests in `proxy.rs` still use the proxy, as intended.

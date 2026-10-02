@@ -15,7 +15,9 @@ RestartSec=2
 # loopback requests through the proxy too and they fail — the renderer never
 # mounts (HYPRLAND-NOTES.md §10). Outbound trade-site requests (proxy.rs,
 # reqwest) still use the proxy. Both spellings because different consumers
-# check different cases.
+# check different cases. The binary also appends these entries itself at
+# startup (main.rs, `exempt_loopback_from_proxy`), so a direct launch works
+# without this unit; the lines here are belt-and-braces.
 Environment=NO_PROXY=127.0.0.1,localhost
 Environment=no_proxy=127.0.0.1,localhost
 

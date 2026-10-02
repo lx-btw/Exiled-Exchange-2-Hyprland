@@ -135,9 +135,10 @@ built here — it's kept only as a porting reference (`main/src/*.ts`).
 - Single instance: a second launch only activates the already-running
   `GApplication`. Stop the service (`systemctl --user stop ee2-hyprland`) or kill
   the exact PID before testing a new build.
-- Proxy: the shell exports `HTTP(S)_PROXY` without `NO_PROXY`. Run a build manually
-  with `NO_PROXY=127.0.0.1,localhost ./target/release/ee2-hyprland` (otherwise the
-  WebView can't load its own loopback assets); `curl` to it needs `--noproxy '*'`.
+- Proxy: the shell exports `HTTP(S)_PROXY` without `NO_PROXY`. The binary adds
+  `127.0.0.1,localhost` to `NO_PROXY`/`no_proxy` itself at startup (otherwise the
+  WebView can't load its own loopback assets), so a manual
+  `./target/release/ee2-hyprland` needs nothing extra; `curl` to it needs `--noproxy '*'`.
   `cargo test` works as-is.
 - `EE2_GAME_CLASS=<class>` points "the game" at another window for testing without
   PoE2 (default `pathofexilesteam.exe`).

@@ -32,6 +32,8 @@ use gtk4::prelude::*;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 fn main() -> gtk4::glib::ExitCode {
+    exempt_loopback_from_proxy();
+
     // GTK owns the main thread's event loop (`app.run_with_args` below), so
     // everything else — server, hotkeys, compositor focus tracking — runs
     // on its own tokio runtime on a background OS thread instead of
@@ -221,7 +223,7 @@ fn main() -> gtk4::glib::ExitCode {
         //
         // Without this, a renderer that fails to mount for *any* reason —
         // a network hiccup, an `http_proxy` env var intercepting our own
-        // loopback asset requests (why the systemd unit sets `NO_PROXY`),
+        // loopback asset requests (why `exempt_loopback_from_proxy` exists),
         // a crash — leaves a full-monitor surface mapped with nothing to
         // hide it. Any rendering problem (e.g. an opaque theme background,
         // see `overlay/window.rs`) then covers the whole screen with no way
@@ -231,4 +233,87 @@ fn main() -> gtk4::glib::ExitCode {
     });
 
     app.run_with_args::<&str>(&[])
+}
+
+/// Adds `127.0.0.1` and `localhost` to `NO_PROXY`/`no_proxy`, keeping
+/// whatever is already there. With a global `http_proxy` and no exemption,
+/// WebKit's network process routes the WebView's requests to our own
+/// loopback server (`server.rs`) through the proxy and the renderer never
+/// mounts (HYPRLAND-NOTES.md §10). Done here rather than only in the
+/// systemd unit so a direct launch (manual run, AppImage) works too.
+/// Outbound trade-site requests (`proxy.rs`) still go through the proxy.
+fn exempt_loopback_from_proxy() {
+    for var in ["NO_PROXY", "no_proxy"] {
+        let current = std::env::var(var).ok();
+        let merged = with_loopback_exempt(current.as_deref());
+        // `set_var` is a safe fn in edition 2021, but it races with any
+        // concurrent env read (getenv in C code included). This runs first
+        // thing in `main`, before the tokio thread, GTK or WebKit exist, so
+        // the process is still single-threaded. Keep it that way.
+        std::env::set_var(var, merged);
+    }
+}
+
+/// Appends the loopback entries missing from a comma-separated no-proxy
+/// list. Existing entries are kept verbatim; comparison is on trimmed
+/// entries, case-insensitively (hostnames).
+fn with_loopback_exempt(current: Option<&str>) -> String {
+    let current = current.unwrap_or("").trim();
+    let mut out = current.to_owned();
+    for host in ["127.0.0.1", "localhost"] {
+        let present = current
+            .split(',')
+            .any(|entry| entry.trim().eq_ignore_ascii_case(host));
+        if !present {
+            if !out.is_empty() {
+                out.push(',');
+            }
+            out.push_str(host);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_loopback_exempt;
+
+    #[test]
+    fn unset_or_empty() {
+        assert_eq!(with_loopback_exempt(None), "127.0.0.1,localhost");
+        assert_eq!(with_loopback_exempt(Some("")), "127.0.0.1,localhost");
+        assert_eq!(with_loopback_exempt(Some("  ")), "127.0.0.1,localhost");
+    }
+
+    #[test]
+    fn keeps_unrelated_entries() {
+        assert_eq!(
+            with_loopback_exempt(Some(".corp.example,10.0.0.0/8")),
+            ".corp.example,10.0.0.0/8,127.0.0.1,localhost"
+        );
+    }
+
+    #[test]
+    fn already_present() {
+        assert_eq!(
+            with_loopback_exempt(Some("localhost,127.0.0.1")),
+            "localhost,127.0.0.1"
+        );
+        assert_eq!(
+            with_loopback_exempt(Some("example.com,localhost")),
+            "example.com,localhost,127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn whitespace_around_entries() {
+        assert_eq!(
+            with_loopback_exempt(Some(" example.com , 127.0.0.1 ")),
+            "example.com , 127.0.0.1,localhost"
+        );
+        assert_eq!(
+            with_loopback_exempt(Some("LOCALHOST")),
+            "LOCALHOST,127.0.0.1"
+        );
+    }
 }
