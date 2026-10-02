@@ -49,6 +49,12 @@ thread_local! {
     // can't await into.
     static INTERACTIVE: Cell<bool> = const { Cell::new(false) };
     static INPUT_FOCUSED: Cell<bool> = const { Cell::new(false) };
+    // Whether the pointer is currently over an overlay widget rather than
+    // the transparent background (`webview.rs`'s hover bridge). Reset to
+    // `false` whenever the overlay goes passthrough — no `mouseout` arrives
+    // while the surface has an empty input region, so a stale `true` would
+    // otherwise grab the keyboard the instant it turned interactive again.
+    static POINTER_OVER_WIDGET: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Must be called once, on the GTK main thread, right after the overlay
@@ -61,8 +67,11 @@ pub fn register_window(window: gtk4::ApplicationWindow) {
 }
 
 /// Applies `KeyboardMode::Exclusive` iff the overlay is currently
-/// mouse-interactive *and* an input element inside the WebView currently
-/// has DOM focus — `None` otherwise. H2B (PLAN.md): before this, keyboard
+/// mouse-interactive *and* either an input element inside the WebView has
+/// DOM focus (priority rule) or the pointer is over an overlay widget
+/// ("keyboard follows pointer": the renderer's Shift stat-tooltip needs
+/// `keydown` on `window`) — `None` otherwise (over the transparent
+/// background, i.e. over the game). H2B (PLAN.md): before this, keyboard
 /// mode was tied 1:1 to interactive/passthrough (`set_passthrough_on_main_thread`
 /// set `Exclusive` the instant the overlay became interactive at all), so
 /// `Shift+Space` opening the overlay stole every keystroke from the game
@@ -74,7 +83,8 @@ pub fn register_window(window: gtk4::ApplicationWindow) {
 fn apply_keyboard_mode() {
     WINDOW.with(|w| {
         if let Some(window) = w.borrow().as_ref() {
-            let exclusive = INTERACTIVE.with(|i| i.get()) && INPUT_FOCUSED.with(|f| f.get());
+            let exclusive = INTERACTIVE.with(|i| i.get())
+                && (INPUT_FOCUSED.with(|f| f.get()) || POINTER_OVER_WIDGET.with(|p| p.get()));
             overlay::window::set_keyboard_mode(window, exclusive);
         }
     });
@@ -92,6 +102,15 @@ fn apply_keyboard_mode() {
 pub fn set_input_focused(focused: bool) {
     INPUT_FOCUSED.with(|f| f.set(focused));
     apply_keyboard_mode();
+}
+
+/// Called from `webview.rs`'s hover-bridge script-message handler (GTK main
+/// thread). Repeats are dropped so the layer surface only sees a keyboard
+/// mode change on an actual transition.
+pub fn set_pointer_over_widget(over: bool) {
+    if POINTER_OVER_WIDGET.with(|p| p.replace(over)) != over {
+        apply_keyboard_mode();
+    }
 }
 
 fn set_passthrough_on_main_thread(passthrough: bool) {
@@ -121,6 +140,9 @@ fn set_passthrough_on_main_thread(passthrough: bool) {
             }
         });
         INTERACTIVE.with(|i| i.set(!passthrough));
+        if passthrough {
+            POINTER_OVER_WIDGET.with(|p| p.set(false));
+        }
         apply_keyboard_mode();
     });
 }

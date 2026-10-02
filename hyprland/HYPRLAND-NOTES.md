@@ -208,6 +208,27 @@ this system):
   `follow_mouse` (Hyprland's default mouse-focus behavior) hands keyboard focus
   back to the game the instant the mouse moves over the overlay, making it
   impossible to actually type into or interact with a widget.
+- **Keyboard model (H2B + hover, 2026-10-02): the keyboard is where the pointer
+  is; a focused text field takes priority.** While the overlay is
+  mouse-interactive, `KeyboardMode` is `Exclusive` iff a text field inside it has
+  DOM focus *or* the pointer is over an overlay widget; over the transparent
+  background (= over the game) it is `None` and the game keeps the keyboard.
+  Reason: the renderer's Shift stat-tooltip (`TradeItem.vue`/`TradeListing.vue`)
+  listens for `keydown`/`keyup` `Shift` on `window`, so the page must actually
+  receive keys while hovered — no synthetic events. Both signals come from
+  injected `UserContentManager` scripts (`webview.rs`: `eeFocus` focusin/out,
+  `eeHover` mouseover). "Background" = `#overlay-window`'s first element child
+  (the `handleBackgroundClick` div), the root, html, body; everything else is a
+  widget. Passthrough (empty input region) resets the hover flag — the pointer is
+  the game's there. Consequences: a hotkey injected into the game while hovering a
+  widget (e.g. `copy-item`) goes to the overlay; `Esc` still closes the overlay
+  via evdev (the grab consumes it, same path as the focused-field case).
+- **`window.open` → system browser.** WebKit's `create` signal is handled in
+  `webview.rs`: http(s) URLs go to `gtk4::UriLauncher`, no new window is created,
+  other schemes are logged and dropped (upstream: `setWindowOpenHandler` →
+  `shell.openExternal`). **Known limitation:** `price-check.builtinBrowser = true`
+  is unsupported — it relies on Electron's `<webview>` tag, absent in WebKit.
+  Keep it off.
 - **Input region toggling, not nullable.** Passthrough mode uses an empty input
   region (`cairo::Region::default()` in the prior GTK3 code — the `gtk4-layer-shell`
   equivalent is the same idea); interactive mode uses a full-window rectangle.

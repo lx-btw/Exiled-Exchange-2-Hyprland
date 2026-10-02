@@ -24,6 +24,10 @@ const ELECTRON_UA_SUBSTRING: &str = "Electron/44.0.0";
 /// posts to — see `focus_bridge_script`'s doc comment.
 const FOCUS_MESSAGE_HANDLER: &str = "eeFocus";
 
+/// The `window.webkit.messageHandlers.<name>` the pointer-hover bridge posts
+/// to — see `hover_bridge_script`'s doc comment.
+const HOVER_MESSAGE_HANDLER: &str = "eeHover";
+
 /// Injected at document-start into every page this `WebView` ever loads
 /// (there's only ever one, the embedded renderer, but `UserScript`s aren't
 /// per-navigation). Bridges DOM focus onto `KeyboardMode` (H2B, PLAN.md):
@@ -63,6 +67,66 @@ fn focus_bridge_script() -> String {
             }});
         }})();"#
     )
+}
+
+/// Injected next to `focus_bridge_script`; reports whether the pointer is
+/// over an overlay *widget* (`true`) or over the transparent background
+/// (`false`), so `state.rs` can make the keyboard follow the pointer
+/// (PLAN.md Stage 5, "keyboard follows pointer"; needed for the Shift
+/// stat-tooltip in trade results, which listens for `keydown` on `window`).
+///
+/// What counts as "background", derived from `OverlayWindow.vue` without
+/// touching it: `#overlay-window`'s first element child is the full-size
+/// `<div>` carrying `@click="handleBackgroundClick"`; the root itself,
+/// `<html>` and `<body>` are the same thing for this purpose. Every other
+/// element is a widget (or other visible overlay content). Widgets' own
+/// transparent areas are `pointer-events-none` in the renderer
+/// (`PriceCheckWindow.vue`), so hit-testing already sends those to the
+/// background div — the event target is the right discriminator. Posts on
+/// every `mouseover` (fires only on element transitions); `state.rs`
+/// ignores repeats, so no dedupe state lives here to go stale across
+/// hide/show.
+fn hover_bridge_script() -> String {
+    format!(
+        r#"(function() {{
+            function isBackground(el) {{
+                if (!el || el === document.documentElement || el === document.body) return true;
+                if (el.id === "overlay-window") return true;
+                var parent = el.parentElement;
+                return !!parent && parent.id === "overlay-window" && parent.firstElementChild === el;
+            }}
+            document.addEventListener("mouseover", function(e) {{
+                window.webkit.messageHandlers.{HOVER_MESSAGE_HANDLER}.postMessage(!isBackground(e.target));
+            }}, true);
+            document.documentElement.addEventListener("mouseleave", function() {{
+                window.webkit.messageHandlers.{HOVER_MESSAGE_HANDLER}.postMessage(false);
+            }});
+        }})();"#
+    )
+}
+
+/// Hands an http(s) URL to the desktop's default handler through
+/// `gtk4::UriLauncher` (the OpenURI portal when sandboxed, the default
+/// app otherwise). Port of upstream's `setWindowOpenHandler` →
+/// `shell.openExternal` (`main/src/windowing/OverlayWindow.ts`); anything
+/// but http/https is refused, same restraint `openExternal` callers in the
+/// renderer rely on (only ever pass web links).
+fn open_external(uri: &str) {
+    let lower = uri.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        eprintln!("ee2-hyprland: window.open: ignoring non-http(s) URL {uri:?}");
+        return;
+    }
+    let uri_owned = uri.to_owned();
+    gtk4::UriLauncher::new(uri).launch(
+        None::<&gtk4::Window>,
+        None::<&gtk4::gio::Cancellable>,
+        move |result| {
+            if let Err(err) = result {
+                eprintln!("ee2-hyprland: window.open: failed to launch {uri_owned:?}: {err}");
+            }
+        },
+    );
 }
 
 /// Builds a transparent WebView loading `url`, tagged with the UA substring
@@ -125,6 +189,18 @@ pub fn build(url: &str) -> WebView {
         state::set_input_focused(value.to_boolean());
     });
 
+    content_manager.add_script(&UserScript::new(
+        &hover_bridge_script(),
+        UserContentInjectedFrames::TopFrame,
+        UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    ));
+    content_manager.register_script_message_handler(HOVER_MESSAGE_HANDLER, None);
+    content_manager.connect_script_message_received(Some(HOVER_MESSAGE_HANDLER), |_ucm, value| {
+        state::set_pointer_over_widget(value.to_boolean());
+    });
+
     let webview = WebView::builder()
         .user_content_manager(&content_manager)
         .build();
@@ -139,6 +215,20 @@ pub fn build(url: &str) -> WebView {
     settings.set_hardware_acceleration_policy(HardwareAccelerationPolicy::Never);
 
     webview.set_background_color(&gdk::RGBA::TRANSPARENT);
+
+    // `window.open(...)` (Trade / wiki / poe2db / update links) arrives as a
+    // `create` request. Open the URL externally and return `None` — no new
+    // WebView/window is ever created. `builtinBrowser = true` is not
+    // supported (Electron `<webview>` tag, absent in WebKit): see PLAN.md.
+    webview.connect_create(|_webview, action| {
+        let action = action.clone();
+        match action.request().and_then(|request| request.uri()) {
+            Some(uri) => open_external(&uri),
+            None => eprintln!("ee2-hyprland: window.open: request without a URL, ignoring"),
+        }
+        None
+    });
+
     webview.load_uri(url);
 
     webview
