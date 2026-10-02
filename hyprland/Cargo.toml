@@ -49,8 +49,9 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 # thread to multiplex "new write job" against the wayland connection's own
 # fd without a timer — already a transitive dep of wayland-client/evdev, so
 # this doesn't add a new library to the tree, just a direct-dependency
-# declaration on parts of one already there.
-rustix = { version = "1", features = ["event"] }
+# declaration on parts of one already there. `fs` adds inotify for
+# game_log.rs's event-driven Client.txt tail.
+rustix = { version = "1", features = ["event", "fs"] }
 
 # tray icon (replaces AppTray.ts)
 ksni = "0.3"

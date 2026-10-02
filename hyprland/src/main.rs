@@ -16,7 +16,10 @@ mod area_tracker;
 mod clipboard;
 mod compositor;
 mod config;
+mod file_writer;
+mod game_log;
 mod input;
+mod logger;
 mod overlay;
 mod proxy;
 mod server;
@@ -48,7 +51,8 @@ fn main() -> gtk4::glib::ExitCode {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
         rt.block_on(async {
-            let (events_tx, _events_rx) = broadcast::channel(32);
+            let (events_tx, _events_rx) = broadcast::channel(256);
+            logger::init(events_tx.clone());
 
             let (overlay, hotkey_bindings, hotkeys_active, overlay_interactive) =
                 match state::Overlay::new(events_tx.clone()) {

@@ -29,9 +29,12 @@ use crate::area_tracker;
 use crate::clipboard::{self, ClipboardEvent};
 use crate::compositor;
 use crate::config::{ConfigStore, GameConfig};
+use crate::file_writer::FileWriter;
+use crate::game_log::GameLogWatcher;
 use crate::input::hotkeys::Bindings;
 use crate::input::inject::VirtualKeyboard;
 use crate::input::keymap::{self, Modifier, Shortcut};
+use crate::logger::ee_log;
 use crate::overlay;
 
 /// How long to wait for the clipboard to show item text after injecting the
@@ -359,6 +362,8 @@ pub struct Overlay {
     bindings: Vec<Binding>,
     hotkey_bindings: Bindings,
     events_tx: broadcast::Sender<Value>,
+    file_writer: Arc<FileWriter>,
+    game_log: GameLogWatcher,
     game_active: bool,
     /// Mirrors `game_active` out to `hotkeys.rs::watch()` — a `watch::Sender`
     /// rather than a plain `Arc<AtomicBool>` (changed 2026-09-24, H2A) so
@@ -496,6 +501,8 @@ impl Overlay {
             bindings: Vec::new(),
             hotkey_bindings: hotkey_bindings.clone(),
             events_tx,
+            file_writer: FileWriter::new(),
+            game_log: GameLogWatcher::new(),
             game_active: false,
             hotkeys_active: hotkeys_active_tx,
             overlay_interactive: false,
@@ -577,6 +584,7 @@ impl Overlay {
     /// `announce_attached`).
     pub async fn initial_events(&self) -> Vec<Value> {
         let mut events = Vec::new();
+        events.extend(crate::logger::history_event());
         events.push(json!({"name": "MAIN->OVERLAY::visibility", "payload": {"isVisible": true}}));
         events.push(json!({
             "name": "MAIN->OVERLAY::focus-change",
@@ -714,7 +722,7 @@ impl Overlay {
     /// pinned (clicked) widget the moment the cursor left it.
     pub async fn set_game_active(&mut self, class: &str) {
         if class.is_empty() && self.game_active && self.overlay_interactive {
-            eprintln!("ee2-hyprland: game focus: ignoring empty class (overlay released keyboard)");
+            ee_log!("game focus: ignoring empty class (overlay released keyboard)");
             return;
         }
         let active = class == compositor::game_class();
@@ -764,9 +772,9 @@ impl Overlay {
         if interactive == self.overlay_interactive {
             return;
         }
-        eprintln!("ee2-hyprland: set_interactive({interactive}): {reason}");
+        ee_log!("set_interactive({interactive}): {reason}");
         if interactive && !self.game_visible {
-            eprintln!("ee2-hyprland: game not on screen, not activating the overlay");
+            ee_log!("game not on screen, not activating the overlay");
             return;
         }
         self.overlay_interactive = interactive;
@@ -884,7 +892,7 @@ impl Overlay {
         let clients = match compositor::clients().await {
             Ok(clients) => clients,
             Err(err) => {
-                eprintln!("ee2-hyprland: copy-item: failed to query clients: {err}");
+                ee_log!("copy-item: failed to query clients: {err}");
                 state.check_in_flight = false;
                 return;
             }
@@ -918,7 +926,7 @@ impl Overlay {
 
         clipboard::drain_stale(&mut state.clipboard_rx);
         if let Err(err) = state.keyboard.copy_item(mods_key).await {
-            eprintln!("ee2-hyprland: copy-item: injection failed: {err}");
+            ee_log!("copy-item: injection failed: {err}");
             state.check_in_flight = false;
             return;
         }
@@ -933,12 +941,12 @@ impl Overlay {
 
         if let Some(previous) = previous {
             if let Err(err) = clipboard::write_text(&previous, xwayland).await {
-                eprintln!("ee2-hyprland: copy-item: failed to restore clipboard: {err}");
+                ee_log!("copy-item: failed to restore clipboard: {err}");
             }
         }
 
         let Some(text) = text else {
-            eprintln!("ee2-hyprland: copy-item: no item text within timeout (xwayland={xwayland})");
+            ee_log!("copy-item: no item text within timeout (xwayland={xwayland})");
             return;
         };
         let (x, y) = position.unwrap_or((0, 0));
@@ -1055,7 +1063,7 @@ impl Overlay {
             let clients = match compositor::clients().await {
                 Ok(clients) => clients,
                 Err(err) => {
-                    eprintln!("ee2-hyprland: stash-search: failed to query clients: {err}");
+                    ee_log!("stash-search: failed to query clients: {err}");
                     return None;
                 }
             };
@@ -1076,14 +1084,14 @@ impl Overlay {
             let settled_rx = match clipboard::write_text_restoring(text, xwayland, previous).await {
                 Ok(rx) => rx,
                 Err(err) => {
-                    eprintln!("ee2-hyprland: stash-search: failed to write clipboard: {err}");
+                    ee_log!("stash-search: failed to write clipboard: {err}");
                     return None;
                 }
             };
 
             let mut state = copy_item.lock().await;
             if let Err(err) = state.keyboard.stash_search().await {
-                eprintln!("ee2-hyprland: stash-search: injection failed: {err}");
+                ee_log!("stash-search: injection failed: {err}");
             }
             drop(state);
             Some(settled_rx)
@@ -1128,7 +1136,7 @@ impl Overlay {
             let clients = match compositor::clients().await {
                 Ok(clients) => clients,
                 Err(err) => {
-                    eprintln!("ee2-hyprland: paste-in-chat: failed to query clients: {err}");
+                    ee_log!("paste-in-chat: failed to query clients: {err}");
                     return None;
                 }
             };
@@ -1152,7 +1160,7 @@ impl Overlay {
                 match clipboard::write_text_restoring(&clip_text, xwayland, previous).await {
                     Ok(rx) => rx,
                     Err(err) => {
-                        eprintln!("ee2-hyprland: paste-in-chat: failed to write clipboard: {err}");
+                        ee_log!("paste-in-chat: failed to write clipboard: {err}");
                         return None;
                     }
                 };
@@ -1188,7 +1196,7 @@ impl Overlay {
             drop(state);
 
             if let Err(err) = inject_result {
-                eprintln!("ee2-hyprland: paste-in-chat: injection failed: {err}");
+                ee_log!("paste-in-chat: injection failed: {err}");
             }
             Some(settled_rx)
         }
@@ -1240,7 +1248,7 @@ impl Overlay {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 if let Err(err) = self.config_store.save(contents, is_temporary).await {
-                    eprintln!("ee2-hyprland: failed to save config: {err}");
+                    ee_log!("failed to save config: {err}");
                 }
                 self.broadcast(json!({
                     "name": "MAIN->CLIENT::config-changed",
@@ -1287,6 +1295,26 @@ impl Overlay {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 self.push_surface();
+
+                self.game_log.restart(
+                    payload
+                        .get("clientLog")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    payload
+                        .get("readClientLog")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    &self.events_tx,
+                    &self.file_writer,
+                );
+                self.file_writer.restart(
+                    payload
+                        .get("libraryAlpha")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    payload.get("libraryOutputPath").and_then(Value::as_str),
+                );
             }
             "CLIENT->MAIN::user-action" => {
                 match payload.get("action").and_then(Value::as_str) {
@@ -1440,10 +1468,8 @@ impl Overlay {
                     ),
                 }
             }
-            "CLIENT->MAIN::write-data" | "CLIENT->MAIN::re-parse-log" => {
-                // Logged, not acted on — same as host.mjs. Session/OCR
-                // logging (`write-data`) is still Stage 5+ territory.
-            }
+            "CLIENT->MAIN::write-data" => self.file_writer.handle(payload),
+            "CLIENT->MAIN::re-parse-log" => self.game_log.reparse(),
             other => {
                 eprintln!("ee2-hyprland: unhandled WS event: {other}");
             }
@@ -1467,6 +1493,6 @@ pub(crate) async fn inject_stash_scroll_tab(overlay: &Weak<TokioMutex<Overlay>>,
     let copy_item = overlay.lock().await.copy_item.clone();
     let mut state = copy_item.lock().await;
     if let Err(err) = state.keyboard.stash_scroll_tab(right).await {
-        eprintln!("ee2-hyprland: stash-scroll: injection failed: {err}");
+        ee_log!("stash-scroll: injection failed: {err}");
     }
 }

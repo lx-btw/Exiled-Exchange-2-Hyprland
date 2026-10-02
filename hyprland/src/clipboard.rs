@@ -33,6 +33,7 @@
 //! after clearing the selection (known to work, just slower) — keep this
 //! module's public interface unchanged either way.
 
+use crate::logger::ee_log;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
@@ -254,9 +255,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
             }
             zwlr_data_control_device_v1::Event::PrimarySelection { id: None } => {}
             zwlr_data_control_device_v1::Event::Finished => {
-                eprintln!(
-                    "ee2-hyprland: clipboard data-control device invalidated (seat removed?), stopping"
-                );
+                ee_log!("clipboard data-control device invalidated (seat removed?), stopping");
                 state.finished = true;
             }
             _ => {}
@@ -363,7 +362,7 @@ pub fn spawn() -> io::Result<mpsc::UnboundedReceiver<ClipboardEvent>> {
         .name("ee2-hyprland-clipboard".into())
         .spawn(move || {
             if let Err(err) = run(tx) {
-                eprintln!("ee2-hyprland: clipboard watcher exited: {err}");
+                ee_log!("clipboard watcher exited: {err}");
             }
         })?;
 
@@ -377,7 +376,7 @@ pub fn spawn() -> io::Result<mpsc::UnboundedReceiver<ClipboardEvent>> {
         .name("ee2-hyprland-clipboard-write".into())
         .spawn(move || {
             if let Err(err) = run_writer(writer_queue) {
-                eprintln!("ee2-hyprland: clipboard writer exited: {err}");
+                ee_log!("clipboard writer exited: {err}");
             }
         })?;
     // Only fails if called twice — `spawn()` itself is documented
@@ -535,7 +534,7 @@ impl Dispatch<ZwlrDataControlSourceV1, Mutex<String>> for WriterState {
                 // path already relied on via stdin.
                 let mut file = std::fs::File::from(fd);
                 if let Err(err) = file.write_all(text.as_bytes()) {
-                    eprintln!("ee2-hyprland: clipboard write: failed to write paste data: {err}");
+                    ee_log!("clipboard write: failed to write paste data: {err}");
                 }
             }
             zwlr_data_control_source_v1::Event::Cancelled => {
@@ -797,7 +796,7 @@ pub async fn write_text_restoring(
                 write_text_native(&restore_to).await
             };
             if let Err(err) = result {
-                eprintln!("ee2-hyprland: clipboard: restore write failed: {err}");
+                ee_log!("clipboard: restore write failed: {err}");
             }
         }
         let _ = settled_tx.send(());

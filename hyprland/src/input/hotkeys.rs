@@ -78,6 +78,7 @@
 //! Fallback if merging modifier state across multiple keyboards proves
 //! unreliable: track only the device that produced the last keydown.
 
+use crate::logger::ee_log;
 use std::collections::HashSet;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -224,8 +225,8 @@ pub async fn watch(
     let mut capture = match Capture::new(&devices) {
         Ok(capture) => Some(capture),
         Err(err) => {
-            eprintln!(
-                "ee2-hyprland: failed to create input-capture mirror device: {err} — \
+            ee_log!(
+                "failed to create input-capture mirror device: {err} — \
                  hotkeys will still fire but their trigger key will leak into the game \
                  (pre-H2 behavior)"
             );
@@ -266,7 +267,7 @@ pub async fn watch(
         let mut stream = match device.into_event_stream() {
             Ok(stream) => stream,
             Err(err) => {
-                eprintln!("ee2-hyprland: failed to open input device for async reads: {err}");
+                ee_log!("failed to open input device for async reads: {err}");
                 continue;
             }
         };
@@ -281,7 +282,7 @@ pub async fn watch(
                                 }
                             }
                             Err(err) => {
-                                eprintln!("ee2-hyprland: input device read error: {err}");
+                                ee_log!("input device read error: {err}");
                                 let _ = events_tx.send((fd, DeviceMsg::Closed));
                                 return;
                             }
@@ -298,8 +299,8 @@ pub async fn watch(
                             stream.device_mut().ungrab()
                         };
                         if let Err(err) = result {
-                            eprintln!(
-                                "ee2-hyprland: failed to {} input device: {err}",
+                            ee_log!(
+                                "failed to {} input device: {err}",
                                 if want_grabbed { "grab" } else { "ungrab" }
                             );
                         }

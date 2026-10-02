@@ -8,6 +8,7 @@
 //!
 //! Stage 4 (see PLAN.md).
 
+use crate::logger::ee_log;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -266,7 +267,7 @@ pub async fn handle(
     {
         Ok(response) => response,
         Err(err) => {
-            eprintln!("ee2-hyprland: proxy request to {host} failed: {err}");
+            ee_log!("proxy request to {host} failed: {err}");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
@@ -281,7 +282,7 @@ pub async fn handle(
     let body = match response.bytes().await {
         Ok(body) => body,
         Err(err) => {
-            eprintln!("ee2-hyprland: proxy response body read failed ({host}): {err}");
+            ee_log!("proxy response body read failed ({host}): {err}");
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };

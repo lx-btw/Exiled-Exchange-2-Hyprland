@@ -13,6 +13,7 @@
 //!
 //! Stage 5, H2A (see PLAN.md).
 
+use crate::logger::ee_log;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -74,7 +75,7 @@ impl Mirror {
             .device
             .emit(&[InputEvent::new(EventType::KEY.0, code.0, value)])
         {
-            eprintln!("ee2-hyprland: mirror device emit failed: {err}");
+            ee_log!("mirror device emit failed: {err}");
         }
     }
 }
@@ -129,17 +130,15 @@ async fn sync_mirror_to_physical(hypr_name: &str) {
                 )
                 .await
                 {
-                    eprintln!(
-                        "ee2-hyprland: capture: failed to sync mirror layout to \"{hypr_name}\": {err}"
-                    );
+                    ee_log!("capture: failed to sync mirror layout to \"{hypr_name}\": {err}");
                 }
             }
-            None => eprintln!(
-                "ee2-hyprland: capture: Hyprland reports no device named \"{hypr_name}\", skipping layout sync"
+            None => ee_log!(
+                "capture: Hyprland reports no device named \"{hypr_name}\", skipping layout sync"
             ),
         },
         Err(err) => {
-            eprintln!("ee2-hyprland: capture: failed to query j/devices for layout sync: {err}")
+            ee_log!("capture: failed to query j/devices for layout sync: {err}")
         }
     }
 }
@@ -155,17 +154,15 @@ async fn sync_physical_to_mirror(hypr_name: &str) {
                 if let Err(err) =
                     compositor::switchxkblayout(hypr_name, dev.active_layout_index).await
                 {
-                    eprintln!(
-                        "ee2-hyprland: capture: failed to restore \"{hypr_name}\" layout: {err}"
-                    );
+                    ee_log!("capture: failed to restore \"{hypr_name}\" layout: {err}");
                 }
             }
-            None => eprintln!(
-                "ee2-hyprland: capture: mirror device not found in j/devices, skipping layout restore"
-            ),
+            None => {
+                ee_log!("capture: mirror device not found in j/devices, skipping layout restore")
+            }
         },
         Err(err) => {
-            eprintln!("ee2-hyprland: capture: failed to query j/devices for layout restore: {err}")
+            ee_log!("capture: failed to query j/devices for layout restore: {err}")
         }
     }
 }
@@ -273,21 +270,21 @@ impl Capture {
         match self.names.get(&fd) {
             Some(hypr_name) if want => sync_mirror_to_physical(hypr_name).await,
             Some(hypr_name) => sync_physical_to_mirror(hypr_name).await,
-            None => eprintln!(
-                "ee2-hyprland: capture: no Hyprland device name resolved for fd {fd}, skipping layout sync"
+            None => ee_log!(
+                "capture: no Hyprland device name resolved for fd {fd}, skipping layout sync"
             ),
         }
 
         if let Err(err) = sender.send(want) {
-            eprintln!(
-                "ee2-hyprland: capture: failed to send {} command to device reader task: {err}",
+            ee_log!(
+                "capture: failed to send {} command to device reader task: {err}",
                 if want { "grab" } else { "ungrab" }
             );
             return;
         }
         self.grabbed.insert(fd, want);
-        eprintln!(
-            "ee2-hyprland: capture: {} input device (fd {fd})",
+        ee_log!(
+            "capture: {} input device (fd {fd})",
             if want { "grabbed" } else { "released" }
         );
     }
