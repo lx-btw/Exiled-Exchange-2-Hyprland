@@ -92,7 +92,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (mut sink, mut stream) = socket.split();
     let mut rx = state.events_tx.subscribe();
 
-    let initial = state.overlay.lock().await.initial_events();
+    let initial = state.overlay.lock().await.initial_events().await;
     for event in initial {
         if sink
             .send(Message::Text(event.to_string().into()))

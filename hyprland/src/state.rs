@@ -38,6 +38,19 @@ use crate::overlay;
 /// copy combo — matches `host.mjs::copyItemText`'s `timeoutMs`.
 const COPY_ITEM_TIMEOUT: Duration = Duration::from_millis(2500);
 
+/// How long the welcome banner needs the (otherwise hidden) surface visible.
+/// Mirrors `renderer/src/web/overlay/LoadingAnimation.vue`: the widget stays
+/// up for its `setTimeout(..., 2500)`, then the `animate__backOutDown` leave
+/// transition plays for animate.css's default `--animate-duration` (1 s,
+/// `renderer/node_modules/animate.css/animate.css`; nothing in `renderer/`
+/// overrides it). Hiding the surface any earlier would clip the leave
+/// animation.
+const ATTACH_BANNER_SHOW: Duration = Duration::from_millis(2500);
+const ATTACH_BANNER_LEAVE: Duration = Duration::from_millis(1000);
+const ATTACH_BANNER_DURATION: Duration = Duration::from_millis(
+    ATTACH_BANNER_SHOW.as_millis() as u64 + ATTACH_BANNER_LEAVE.as_millis() as u64,
+);
+
 thread_local! {
     static WINDOW: RefCell<Option<gtk4::ApplicationWindow>> = const { RefCell::new(None) };
     // Both GTK-main-thread-only, mirroring state that's authoritative
@@ -164,6 +177,23 @@ async fn overlay_monitor_origin() -> Option<(i32, i32)> {
         });
     });
     rx.await.ok().flatten()
+}
+
+/// Shows the surface for the welcome banner: visible, but click-through and
+/// without keyboard focus, so the game keeps receiving all input. A
+/// currently-interactive overlay is left as it is (only made visible).
+fn show_banner_on_main_thread() {
+    gtk4::glib::MainContext::default().invoke(|| {
+        WINDOW.with(|w| {
+            if let Some(window) = w.borrow().as_ref() {
+                overlay::window::set_visible(window, true);
+                if !INTERACTIVE.with(|i| i.get()) {
+                    overlay::window::set_input_region(window, true);
+                }
+            }
+        });
+        apply_keyboard_mode();
+    });
 }
 
 fn set_visible_on_main_thread(visible: bool) {
@@ -432,6 +462,20 @@ pub struct Overlay {
     /// the same class of problem `run_copy_item`'s split-lock design
     /// avoids, see its docs.
     self_ref: Weak<TokioMutex<Overlay>>,
+    /// `overlay-attached` already sent for the current game window — reset
+    /// by `on_window_opened`, so alt-tabbing back doesn't repeat the banner.
+    game_attached: bool,
+    /// `overlay-attached` was due but no WS client was connected to take
+    /// it (service started with the game already running) — delivered from
+    /// `initial_events` to the next client instead.
+    attach_pending: bool,
+    /// The welcome banner currently holds the surface visible; `generation`
+    /// distinguishes overlapping banners' timers.
+    banner_active: bool,
+    banner_generation: u64,
+    /// Last `render-state` `shouldShow`, so the banner's end knows whether
+    /// the renderer wants the surface to stay.
+    render_should_show: bool,
 }
 
 impl Overlay {
@@ -471,6 +515,11 @@ impl Overlay {
             restore_clipboard_enabled: false,
             chat_action_in_flight: Arc::new(AtomicBool::new(false)),
             self_ref: Weak::new(),
+            game_attached: false,
+            attach_pending: false,
+            banner_active: false,
+            banner_generation: 0,
+            render_should_show: false,
         };
         Ok((
             overlay,
@@ -523,26 +572,90 @@ impl Overlay {
     }
 
     /// The events a freshly-connected WS client needs sent immediately —
-    /// `host.mjs`'s connection handler sent these three eagerly rather than
-    /// waiting for the client to ask.
-    pub fn initial_events(&self) -> Vec<Value> {
-        vec![
-            json!({"name": "MAIN->OVERLAY::overlay-attached"}),
-            json!({"name": "MAIN->OVERLAY::visibility", "payload": {"isVisible": true}}),
-            json!({
-                "name": "MAIN->OVERLAY::focus-change",
-                "payload": {
-                    "game": self.game_active,
-                    "overlay": self.overlay_interactive,
-                    "usingHotkey": false,
-                },
-            }),
-        ]
+    /// `host.mjs`'s connection handler sent these eagerly rather than
+    /// waiting for the client to ask. `overlay-attached` is *not* among
+    /// them (it fires when the game window attaches, see
+    /// `announce_attached`) except when that was due with nobody listening.
+    pub async fn initial_events(&mut self) -> Vec<Value> {
+        let mut events = Vec::new();
+        if std::mem::take(&mut self.attach_pending) {
+            self.begin_attach_banner().await;
+            events.push(json!({"name": "MAIN->OVERLAY::overlay-attached"}));
+        }
+        events.push(json!({"name": "MAIN->OVERLAY::visibility", "payload": {"isVisible": true}}));
+        events.push(json!({
+            "name": "MAIN->OVERLAY::focus-change",
+            "payload": {
+                "game": self.game_active,
+                "overlay": self.overlay_interactive,
+                "usingHotkey": false,
+            },
+        }));
+        events
+    }
+
+    /// A new window mapped: a fresh game window re-arms the once-per-window
+    /// welcome banner (fires on its first focus, `set_game_active`).
+    pub fn on_window_opened(&mut self, class: &str) {
+        if class == compositor::game_class() {
+            self.game_attached = false;
+        }
+    }
+
+    /// Ports upstream's `handleOverlayAttached` (`OverlayWindow.ts`): tell
+    /// the renderer the overlay is attached to the game window, once per
+    /// game window.
+    async fn announce_attached(&mut self) {
+        self.game_attached = true;
+        if self.events_tx.receiver_count() == 0 {
+            self.attach_pending = true;
+            return;
+        }
+        self.begin_attach_banner().await;
+        self.broadcast(json!({"name": "MAIN->OVERLAY::overlay-attached"}));
+    }
+
+    /// `showAttachNotification` from the saved config (renderer default:
+    /// true). The renderer checks it too before showing the banner; this
+    /// side only decides whether the surface needs to be shown for it.
+    async fn show_attach_notification(&self) -> bool {
+        self.config_store
+            .load()
+            .await
+            .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+            .and_then(|v| v.get("showAttachNotification")?.as_bool())
+            .unwrap_or(true)
+    }
+
+    /// Shows the surface click-through for `ATTACH_BANNER_DURATION`, then
+    /// hides it again unless `render-state` wants it visible by then.
+    async fn begin_attach_banner(&mut self) {
+        if !self.show_attach_notification().await {
+            return;
+        }
+        self.banner_active = true;
+        self.banner_generation += 1;
+        let generation = self.banner_generation;
+        show_banner_on_main_thread();
+        let weak = self.self_ref.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(ATTACH_BANNER_DURATION).await;
+            let Some(overlay) = weak.upgrade() else {
+                return;
+            };
+            let mut guard = overlay.lock().await;
+            if guard.banner_generation == generation {
+                guard.banner_active = false;
+                if !guard.render_should_show {
+                    set_visible_on_main_thread(false);
+                }
+            }
+        });
     }
 
     /// Called by the compositor focus-watcher whenever the focused window's
     /// class changes.
-    pub fn set_game_active(&mut self, class: &str) {
+    pub async fn set_game_active(&mut self, class: &str) {
         let active = class == compositor::game_class();
         if active == self.game_active {
             return;
@@ -550,6 +663,9 @@ impl Overlay {
         self.game_active = active;
         let _ = self.hotkeys_active.send(active);
         self.send_focus_change(false);
+        if active && !self.game_attached {
+            self.announce_attached().await;
+        }
     }
 
     /// `pub(crate)`, not private — `area_tracker.rs` calls this directly,
@@ -1175,7 +1291,13 @@ impl Overlay {
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
                 eprintln!("ee2-hyprland: render-state shouldShow={should_show}");
-                set_visible_on_main_thread(should_show);
+                self.render_should_show = should_show;
+                // The welcome banner's own hold on the surface isn't part of
+                // `shouldShow`; don't let an unrelated "false" cut it short
+                // (the banner's timer re-checks `render_should_show`).
+                if should_show || !self.banner_active || self.overlay_interactive {
+                    set_visible_on_main_thread(should_show);
+                }
             }
             "CLIENT->MAIN::used-recently" => {
                 // Ports `OverlayWindow.ts`'s `this.wasUsedRecently =

@@ -173,8 +173,16 @@ fn main() -> gtk4::glib::ExitCode {
             {
                 let overlay = overlay.clone();
                 tokio::spawn(async move {
-                    while let Some((class, _title)) = focus_rx.recv().await {
-                        overlay.lock().await.set_game_active(&class);
+                    while let Some(event) = focus_rx.recv().await {
+                        let mut guard = overlay.lock().await;
+                        match event {
+                            compositor::WatchEvent::ActiveWindow(class, _title) => {
+                                guard.set_game_active(&class).await
+                            }
+                            compositor::WatchEvent::WindowOpened(class) => {
+                                guard.on_window_opened(&class)
+                            }
+                        }
                     }
                 });
             }

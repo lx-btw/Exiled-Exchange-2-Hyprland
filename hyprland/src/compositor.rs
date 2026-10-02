@@ -201,12 +201,23 @@ pub fn find_game(clients: &[Client]) -> Option<&Client> {
     clients.iter().find(|c| c.class == class)
 }
 
-/// Subscribes to `.socket2.sock` and sends `(class, title)` on `tx` every
-/// time the focused window changes. Resolves and sends the *current* focus
+/// What `watch_active_window` reports.
+#[derive(Debug)]
+pub enum WatchEvent {
+    /// The focused window changed (or, first, the current focus): `(class, title)`.
+    ActiveWindow(String, String),
+    /// A new window was mapped (`openwindow>>ADDRESS,WORKSPACE,CLASS,TITLE`);
+    /// carries its class. Lets `state.rs` tell a fresh game window from
+    /// mere re-focus of an existing one (welcome banner, once per window).
+    WindowOpened(String),
+}
+
+/// Subscribes to `.socket2.sock` and sends [`WatchEvent`]s on `tx` every
+/// time the focused window changes or a window opens. Resolves and sends the *current* focus
 /// first — `activewindow` events fire only on change, so without this the
 /// caller's idea of focus would be wrong until the first alt-tab (the same
 /// gap `host.mjs::watchHyprland()` closes the same way).
-pub async fn watch_active_window(tx: mpsc::UnboundedSender<(String, String)>) -> io::Result<()> {
+pub async fn watch_active_window(tx: mpsc::UnboundedSender<WatchEvent>) -> io::Result<()> {
     let dir = socket_dir().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -216,7 +227,7 @@ pub async fn watch_active_window(tx: mpsc::UnboundedSender<(String, String)>) ->
 
     match active_window().await {
         Ok(Some(client)) => {
-            let _ = tx.send((client.class, client.title));
+            let _ = tx.send(WatchEvent::ActiveWindow(client.class, client.title));
         }
         Ok(None) => {}
         Err(err) => eprintln!("ee2-hyprland: initial active_window() query failed: {err}"),
@@ -254,7 +265,25 @@ pub async fn watch_active_window(tx: mpsc::UnboundedSender<(String, String)>) ->
                 let Some((class, title)) = data.split_once(',') else {
                     continue;
                 };
-                if tx.send((class.to_string(), title.to_string())).is_err() {
+                if tx
+                    .send(WatchEvent::ActiveWindow(
+                        class.to_string(),
+                        title.to_string(),
+                    ))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            } else if event == "openwindow" {
+                // ADDRESS,WORKSPACE,CLASS,TITLE — class is the third field;
+                // commas in the title only add fields after it.
+                let Some(class) = data.split(',').nth(2) else {
+                    continue;
+                };
+                if tx
+                    .send(WatchEvent::WindowOpened(class.to_string()))
+                    .is_err()
+                {
                     return Ok(());
                 }
             }

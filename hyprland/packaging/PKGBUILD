@@ -116,8 +116,12 @@ package() {
   # boundary is about never *editing* main/renderer/ipc/dataParser, not
   # about never reading an asset out of them). Repo root LICENSE (MIT)
   # covers it same as everything else in the tree.
-  install -Dm644 "$_repo_root/main/build/icons/512x512.png" \
-    "$pkgdir/usr/share/icons/hicolor/512x512/apps/ee2-hyprland.png"
+  # Every size upstream ships (no resizing tool needed as a build dep);
+  # small ones matter for tray hosts/launchers that pick an exact size.
+  for size in 16 24 32 48 64 128 256 512; do
+    install -Dm644 "$_repo_root/main/build/icons/${size}x${size}.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/ee2-hyprland.png"
+  done
 
   install -Dm644 "$_repo_root/LICENSE" \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
