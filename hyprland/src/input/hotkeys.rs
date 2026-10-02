@@ -205,8 +205,7 @@ pub async fn watch(
         Err(err) => {
             ee_log!(
                 "failed to create input-capture mirror device: {err} — \
-                 hotkeys will still fire but their trigger key will leak into the game \
-                 (pre-H2 behavior)"
+                 hotkeys will still fire but their trigger key will leak into the game"
             );
             None
         }
