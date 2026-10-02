@@ -465,9 +465,11 @@ pub struct Overlay {
     /// `overlay-attached` already sent for the current game window — reset
     /// by `on_window_opened`, so alt-tabbing back doesn't repeat the banner.
     game_attached: bool,
-    /// `overlay-attached` was due but no WS client was connected to take
-    /// it (service started with the game already running) — delivered from
-    /// `initial_events` to the next client instead.
+    /// `overlay-attached` was due before the renderer was ready (service
+    /// started with the game already running) — delivered on the first
+    /// `render-state`. Not on WS connect: the Vue components haven't
+    /// registered their `Host.onEvent` handlers yet at that point, so the
+    /// event would be dropped.
     attach_pending: bool,
     /// The welcome banner currently holds the surface visible; `generation`
     /// distinguishes overlapping banners' timers.
@@ -476,6 +478,8 @@ pub struct Overlay {
     /// Last `render-state` `shouldShow`, so the banner's end knows whether
     /// the renderer wants the surface to stay.
     render_should_show: bool,
+    /// A `render-state` has been received: the renderer's Vue app is up.
+    renderer_ready: bool,
 }
 
 impl Overlay {
@@ -520,6 +524,7 @@ impl Overlay {
             banner_active: false,
             banner_generation: 0,
             render_should_show: false,
+            renderer_ready: false,
         };
         Ok((
             overlay,
@@ -575,13 +580,9 @@ impl Overlay {
     /// `host.mjs`'s connection handler sent these eagerly rather than
     /// waiting for the client to ask. `overlay-attached` is *not* among
     /// them (it fires when the game window attaches, see
-    /// `announce_attached`) except when that was due with nobody listening.
-    pub async fn initial_events(&mut self) -> Vec<Value> {
+    /// `announce_attached`).
+    pub async fn initial_events(&self) -> Vec<Value> {
         let mut events = Vec::new();
-        if std::mem::take(&mut self.attach_pending) {
-            self.begin_attach_banner().await;
-            events.push(json!({"name": "MAIN->OVERLAY::overlay-attached"}));
-        }
         events.push(json!({"name": "MAIN->OVERLAY::visibility", "payload": {"isVisible": true}}));
         events.push(json!({
             "name": "MAIN->OVERLAY::focus-change",
@@ -607,10 +608,16 @@ impl Overlay {
     /// game window.
     async fn announce_attached(&mut self) {
         self.game_attached = true;
-        if self.events_tx.receiver_count() == 0 {
+        // No `render-state` yet means the renderer hasn't mounted.
+        if !self.renderer_ready {
             self.attach_pending = true;
             return;
         }
+        self.deliver_attached().await;
+    }
+
+    async fn deliver_attached(&mut self) {
+        eprintln!("ee2-hyprland: overlay-attached");
         self.begin_attach_banner().await;
         self.broadcast(json!({"name": "MAIN->OVERLAY::overlay-attached"}));
     }
@@ -1297,6 +1304,10 @@ impl Overlay {
                 // (the banner's timer re-checks `render_should_show`).
                 if should_show || !self.banner_active || self.overlay_interactive {
                     set_visible_on_main_thread(should_show);
+                }
+                self.renderer_ready = true;
+                if std::mem::take(&mut self.attach_pending) {
+                    self.deliver_attached().await;
                 }
             }
             "CLIENT->MAIN::used-recently" => {
