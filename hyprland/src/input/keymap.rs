@@ -9,8 +9,6 @@
 //! (`main/src/shortcuts/Shortcuts.ts`) — but maps them to evdev `KeyCode`
 //! instead of upstream's Windows virtual-key codes, since we read/inject at
 //! the evdev layer, not through Electron/uiohook.
-//!
-//! Stage 2 (see PLAN.md).
 
 use evdev::KeyCode;
 
@@ -170,21 +168,18 @@ pub struct Shortcut {
 /// crash the listener. Callers that source shortcuts from user config
 /// should log a `None` result rather than silently dropping it.
 ///
-/// **Known gap, now live**: upstream's `eventToString()` (`Shortcuts.ts:350`)
+/// **Known gap**: upstream's `eventToString()` (`Shortcuts.ts:350`)
 /// can produce a bare `"Ctrl"`/`"Shift"`/`"Alt"` string when a user's
 /// recorded trigger is a modifier pressed alone — this doesn't fit the
-/// modifiers-plus-base-key `Shortcut` shape and isn't parsed here. As of
-/// Stage 4, `state.rs::parse_bindings` feeds real `HostConfig.shortcuts`
-/// strings from the renderer through this parser, so a user who recorded
-/// such a hotkey now hits this: the shortcut is dropped with an `eprintln`
-/// (invisible unless someone's watching the process's stderr, not
-/// surfaced to the renderer/UI at all). Representing it correctly needs a
-/// design decision first — the natural encoding (`Shortcut { key:
-/// KEY_LEFTCTRL, ctrl: true, .. }`) is self-referential: `hotkeys.rs`'s
-/// exact-match check computes `ctrl` from the same keydown that would be
-/// the trigger, so "Ctrl alone" and "Ctrl held" can't both be expressed as
-/// stated without resolving that ambiguity deliberately — not attempted
-/// here.
+/// modifiers-plus-base-key `Shortcut` shape and isn't parsed here.
+/// `state.rs::parse_bindings` feeds real `HostConfig.shortcuts` strings from
+/// the renderer through this parser, so such a hotkey is dropped with an
+/// `eprintln` (journal only, not surfaced to the renderer/UI). Representing
+/// it correctly needs a design decision first — the natural encoding
+/// (`Shortcut { key: KEY_LEFTCTRL, ctrl: true, .. }`) is self-referential:
+/// `hotkeys.rs`'s exact-match check computes `ctrl` from the same keydown
+/// that would be the trigger, so "Ctrl alone" and "Ctrl held" can't both be
+/// expressed without resolving that ambiguity deliberately.
 pub fn parse_shortcut(s: &str) -> Option<Shortcut> {
     let mut ctrl = false;
     let mut shift = false;

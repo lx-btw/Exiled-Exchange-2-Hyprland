@@ -13,8 +13,8 @@
 //! "any", ...)` all collapse to the same thing: broadcast to every current
 //! `/events` connection (matching `host.mjs`'s own simpler `broadcast()`).
 //!
-//! Stage 1 (static serving) / Stage 4 (`/config`, `/proxy/<url>`, WS
-//! `/events`) — see PLAN.md.
+//! When upstream changes `ipc/types.ts`, that diff is the list of what this
+//! module and `state.rs::handle_ws_event` need to catch up on.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

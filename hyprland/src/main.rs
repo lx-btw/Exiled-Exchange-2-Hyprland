@@ -1,16 +1,15 @@
-//! Entrypoint for the Hyprland-native platform layer.
+//! Entrypoint for the Hyprland-native platform layer: wires the modules
+//! below together. `HYPRLAND-NOTES.md` has the design rationale.
 //!
-//! See `PLAN.md` (repo root) for the implementation stages and
-//! `HYPRLAND-NOTES.md` for the design rationale behind each module below.
-//! Stage 1: WebKit spike (layer-shell overlay + WebView). Stage 2: Hyprland
-//! IPC, evdev hotkeys, uinput injection. Stage 3: event-driven clipboard
-//! read-back. Stage 4 (this wiring): the full `ipc/types.ts` protocol
-//! server (`server.rs`) and the state machine tying everything together
-//! (`state.rs`) — hotkeys are no longer hardcoded to a single test combo;
-//! they come from whatever `HostConfig.shortcuts` the renderer pushes over
-//! WS once it mounts (`OverlayWindow.vue`'s `pushHostConfig()`, sent
-//! automatically on mount, no user action needed), and can change live if
-//! the user edits a hotkey in Settings.
+//! Threads: GTK owns the main thread (layer-shell overlay window + WebView,
+//! `overlay/`); everything else — the `ipc/types.ts` protocol server
+//! (`server.rs`), the state machine (`state.rs`), evdev hotkeys/capture
+//! (`input/`), hover tracking (`area_tracker.rs`), Hyprland IPC
+//! (`compositor.rs`), tray — runs on a tokio runtime on a background
+//! thread. Hotkeys aren't configured here: they come from whatever
+//! `HostConfig.shortcuts` the renderer pushes over WS once it mounts
+//! (`OverlayWindow.vue`'s `pushHostConfig()`), and change live when the
+//! user edits a hotkey in Settings.
 
 mod area_tracker;
 mod clipboard;
@@ -33,16 +32,6 @@ use gtk4::prelude::*;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 fn main() -> gtk4::glib::ExitCode {
-    // Render-storm fix (PLAN.md, "Storm mechanism" / Session 7, and G1):
-    // applied per-`WebView` in `overlay/webview.rs` via
-    // `settings.set_hardware_acceleration_policy(Never)`, not here. Used to
-    // be a process-wide `WEBKIT_DISABLE_COMPOSITING_MODE=1` env var set as
-    // the first line of `main()` (before any WebKit object existed, since
-    // WebKitGTK only reads that var at library init) — G1 confirmed the
-    // per-`WebView` settings call reproduces the exact same fix, so it
-    // replaced the env var/`unsafe` altogether. See `webview.rs`'s `build()`
-    // doc comment for the storm mechanism and why this call fixes it.
-
     // GTK owns the main thread's event loop (`app.run_with_args` below), so
     // everything else — server, hotkeys, compositor focus tracking — runs
     // on its own tokio runtime on a background OS thread instead of
@@ -100,13 +89,14 @@ fn main() -> gtk4::glib::ExitCode {
             // name (`input::inject::VIRTUAL_KEYBOARD_NAME`). If a future
             // refactor ever made hotkey watching start *before* the virtual
             // device exists, that exclusion would silently miss it and
-            // reintroduce the self-triggering feedback loop PLAN.md
-            // documents as an already-happened real bug (Stage 2 review) —
-            // keep `Overlay::new()` (or anything else that constructs a
-            // `VirtualKeyboard`) strictly before this line.
+            // the matcher would read back our own injected keys — a
+            // self-triggering feedback loop (e.g. a hotkey bound to
+            // `Ctrl+Alt+C` re-firing itself). Keep `Overlay::new()` (or
+            // anything else that constructs a `VirtualKeyboard`) strictly
+            // before this line.
             let modifiers = input::hotkeys::ModifierState::new();
             let (hotkey_tx, mut hotkey_rx) = mpsc::unbounded_channel();
-            // `close_overlay_tx`: H2B's evdev-level `Esc` handling
+            // `close_overlay_tx`: the evdev-level `Esc` handling
             // (`hotkeys.rs`) — a built-in action, not a `bindings` entry, so
             // it gets its own channel rather than an index into
             // `hotkey_bindings` (see `hotkeys.rs`'s own docs on why `Esc`
@@ -230,15 +220,13 @@ fn main() -> gtk4::glib::ExitCode {
         // event (`state.rs::handle_ws_event`) or an interactive action.
         //
         // Without this, a renderer that fails to mount for *any* reason —
-        // a network hiccup, a proxy env var intercepting our own loopback
-        // asset requests (a real, previously-flagged risk: see PLAN.md
-        // Stage 1's `NO_PROXY` note), a crash — leaves this surface
-        // sitting fully visible with nothing to hide it, and the still-
-        // open Stage 1 WebView-transparency bug means that's an opaque
-        // backdrop covering the entire screen, indefinitely, with no
-        // visual way to tell what's clickable underneath. This happened
-        // for real during Stage 5 manual testing (2026-09-24) and forced
-        // a blind logout — see PLAN.md's Stage 5 entry.
+        // a network hiccup, an `http_proxy` env var intercepting our own
+        // loopback asset requests (why the systemd unit sets `NO_PROXY`),
+        // a crash — leaves a full-monitor surface mapped with nothing to
+        // hide it. Any rendering problem (e.g. an opaque theme background,
+        // see `overlay/window.rs`) then covers the whole screen with no way
+        // to tell what's clickable underneath — it has happened, and needed
+        // a blind logout to recover.
         window.set_visible(false);
     });
 

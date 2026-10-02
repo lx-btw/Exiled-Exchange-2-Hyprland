@@ -6,7 +6,11 @@
 //! useSessionCookies: true })`; without an Electron session we track it
 //! ourselves, same as the prior prototype had to.
 //!
-//! Stage 4 (see PLAN.md).
+//! Unlike Electron's single `net.request` hop, this is a real two-hop relay
+//! (WebView -> us -> trade host), so hop-by-hop headers and
+//! `Accept-Encoding` need explicit handling — see `request_headers`/
+//! `response_headers`. reqwest honors `HTTP(S)_PROXY`/`NO_PROXY` from the
+//! environment.
 
 use crate::logger::ee_log;
 use std::collections::HashMap;
@@ -174,10 +178,10 @@ fn request_headers(headers: &HeaderMap) -> HeaderMap {
 }
 
 /// Strips headers that must not be forwarded as-is: hop-by-hop (see
-/// `hop_by_hop_headers` — this is what previously let a chunked
-/// `Transfer-Encoding` through on top of a body we'd already fully
-/// buffered via `.bytes()`, producing a framing mismatch WebKit reported as
-/// a bare "Load failed" with no diagnostic on our side), `content-encoding`/
+/// `hop_by_hop_headers` — forwarding Cloudflare's chunked
+/// `Transfer-Encoding` on top of a body we've already fully buffered via
+/// `.bytes()` produces a framing mismatch WebKit reports as a bare "Load
+/// failed", e.g. "Failed to load leagues", with no diagnostic on our side), `content-encoding`/
 /// `content-length` (describe the *upstream* transfer — reqwest already
 /// decompresses and strips these itself when its own decompression
 /// features handled the body, but we still hand back plain bytes either

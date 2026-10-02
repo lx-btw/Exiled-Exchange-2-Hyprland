@@ -11,10 +11,11 @@
 //!
 //! Owns the whole price-check flow end to end (`run_copy_item`): find the
 //! game window, inject `Ctrl+Alt+C`, read the clipboard back, broadcast
-//! `item-text` to the renderer, switch the overlay interactive. This is
-//! "port `host.mjs`'s `runPriceCheck()`", not new design.
-//!
-//! Stage 4 (see PLAN.md).
+//! `item-text` to the renderer, optionally switch the overlay interactive.
+//! Also stash-search / paste-in-chat (`run_stash_search`,
+//! `run_paste_in_chat`), the layer surface's visibility (`push_surface`:
+//! game on screen, render-state, welcome banner, `hideOverlayOnBlur`), and
+//! the WS event dispatcher (`handle_ws_event`).
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -58,8 +59,8 @@ thread_local! {
     static WINDOW: RefCell<Option<gtk4::ApplicationWindow>> = const { RefCell::new(None) };
     // Both GTK-main-thread-only, mirroring state that's authoritative
     // elsewhere (`Overlay::overlay_interactive`'s `bool`, and the WebView's
-    // own DOM focus) — cached here purely so `apply_keyboard_mode` (H2B,
-    // below) can be called synchronously from a WebKit signal handler
+    // own DOM focus) — cached here purely so `apply_keyboard_mode` (below)
+    // can be called synchronously from a WebKit signal handler
     // (`webview.rs`, fires on this same thread) without needing the async
     // `TokioMutex<Overlay>` lock, which a synchronous GTK/WebKit C callback
     // can't await into.
@@ -87,15 +88,13 @@ pub fn register_window(window: gtk4::ApplicationWindow) {
 /// DOM focus (priority rule) or the pointer is over an overlay widget
 /// ("keyboard follows pointer": the renderer's Shift stat-tooltip needs
 /// `keydown` on `window`) — `None` otherwise (over the transparent
-/// background, i.e. over the game). H2B (PLAN.md): before this, keyboard
-/// mode was tied 1:1 to interactive/passthrough (`set_passthrough_on_main_thread`
-/// set `Exclusive` the instant the overlay became interactive at all), so
-/// `Shift+Space` opening the overlay stole every keystroke from the game
-/// immediately, not just while actually typing into a field — this is what
-/// makes WASD keep working while the overlay is open and mouse-clickable.
-/// Called from two places, both already on the GTK main thread:
-/// `set_passthrough_on_main_thread` (when `Overlay.overlay_interactive`
-/// changes) and `set_input_focused` (when DOM focus changes, `webview.rs`).
+/// background, i.e. over the game). Tying keyboard mode 1:1 to
+/// interactive/passthrough instead would make `Shift+Space` steal every
+/// keystroke from the game the moment the overlay opens; this is what
+/// keeps WASD working while the overlay is open and mouse-clickable.
+/// Called on the GTK main thread from `apply_surface` (interactive state
+/// changes) and from `set_input_focused`/`set_pointer_over_widget`
+/// (`webview.rs`'s bridges).
 fn apply_keyboard_mode() {
     WINDOW.with(|w| {
         if let Some(window) = w.borrow().as_ref() {
@@ -154,8 +153,7 @@ fn apply_surface(surface: Surface) {
                 if surface.visible {
                     // Shown *first*, then region/keyboard mode: both are
                     // silently ignored on a not-yet-mapped layer surface
-                    // (found live 2026-09-24 — the overlay opened without
-                    // grabbing input and hotkeys leaked to the game).
+                    // (the overlay then opens without taking input).
                     overlay::window::set_monitor_by_origin(window, surface.origin);
                     overlay::window::set_visible(window, true);
                     overlay::window::set_input_region(window, !surface.interactive);
@@ -188,9 +186,9 @@ async fn overlay_monitor_origin() -> Option<(i32, i32)> {
 }
 
 /// A parsed `ShortcutAction` (`ipc/types.ts`) this fork can actually act on.
-/// Action types not listed here (`ocr-text`, `test-only`) are still Stage 5+
-/// (`ocr-text` is N/A — Windows-only upstream, heist-gem OCR) and are
-/// dropped during parsing — see `parse_bindings`.
+/// Action types not listed here (`ocr-text` — heist-gem OCR, Windows-only
+/// even upstream — and `test-only`) are dropped during parsing — see
+/// `parse_bindings`.
 #[derive(Debug, Clone)]
 enum Action {
     CopyItem { target: String, focus_overlay: bool },
@@ -366,26 +364,21 @@ pub struct Overlay {
     game_log: GameLogWatcher,
     game_active: bool,
     /// Mirrors `game_active` out to `hotkeys.rs::watch()` — a `watch::Sender`
-    /// rather than a plain `Arc<AtomicBool>` (changed 2026-09-24, H2A) so
-    /// that loop can react to a focus change the instant it happens (via
-    /// `select!` on `.changed()`), not only on the next keystroke. That
-    /// distinction didn't matter before capture existed (matching was
-    /// stateless either way), but it does now: capture needs to grab a
-    /// device the moment the game gains focus, or the very first hotkey
-    /// press after every alt-tab leaks its trigger key into the game (see
-    /// PLAN.md's H2 entry) — an `Arc<AtomicBool>` gives no way to wait for
-    /// that transition, only to poll it. Ports upstream's `Shortcuts.ts`:
-    /// `poeWindow.on("active-change", ...)` calls `globalShortcut`
-    /// `register()`/`unregister()`, so hotkeys only fire (and capture only
-    /// grabs) while PoE2 is the focused window. Found missing live
-    /// (2026-09-24): without some form of this gate, e.g. `Shift + Space`
-    /// toggled the overlay from *any* focused window, not just the game — a
-    /// real behavioral gap from upstream, not a hypothetical.
+    /// rather than a plain `Arc<AtomicBool>` so that loop can react to a
+    /// focus change the instant it happens (via `select!` on `.changed()`),
+    /// not only on the next keystroke: capture needs to grab a device the
+    /// moment the game gains focus, or the very first hotkey press after
+    /// every alt-tab leaks its trigger key into the game. Ports upstream's
+    /// `Shortcuts.ts`: `poeWindow.on("active-change", ...)` calls
+    /// `globalShortcut` `register()`/`unregister()`, so hotkeys only fire
+    /// (and capture only grabs) while PoE2 is the focused window — without
+    /// this gate, e.g. `Shift + Space` would toggle the overlay from *any*
+    /// focused window.
     hotkeys_active: watch::Sender<bool>,
     overlay_interactive: bool,
     /// Mirrors `overlay_interactive` out to `hotkeys.rs::watch()`, same
-    /// `watch` shape and reason as `hotkeys_active` — added 2026-09-24, H2B,
-    /// for evdev-level `Esc` handling: upstream's `OverlayWindow.ts`
+    /// `watch` shape and reason as `hotkeys_active` — for evdev-level `Esc`
+    /// handling: upstream's `OverlayWindow.ts`
     /// hardcodes `Escape` (in its `before-input-event` handler, entirely
     /// separate from `Shortcuts.ts`'s user-configurable bindings) to always
     /// close an interactive overlay, so `hotkeys.rs`'s central loop needs to
@@ -405,7 +398,7 @@ pub struct Overlay {
     /// toggle-overlay silently skip starting or stopping a tracking session
     /// rather than panicking.
     area_tracker: Option<area_tracker::Handle>,
-    /// `stashScroll` (Phase C, PLAN.md): `HostConfig.stashScroll`, mirrored
+    /// `stashScroll`: `HostConfig.stashScroll`, mirrored
     /// here the same way `used_recently` mirrors `used-recently` — plain
     /// polled state rather than a `watch` channel, since `area_tracker.rs`
     /// already has to `upgrade()`+lock `self_ref`-style to reach `Overlay`
@@ -791,12 +784,11 @@ impl Overlay {
     /// case (via `assertGameActive`) — called from `hotkeys.rs`'s evdev-level
     /// `Esc` handling. `Esc` isn't a user-configurable shortcut; upstream
     /// hardcodes it the same way, entirely separate from `Shortcuts.ts`'s
-    /// bindings. **Unlike `toggle_overlay`, this only ever deactivates** —
-    /// verified against upstream's actual source (not the original task's
-    /// assumption that Escape would behave differently while a text field
-    /// has focus): `before-input-event` intercepts Escape before the
+    /// bindings. **Unlike `toggle_overlay`, this only ever deactivates.**
+    /// Upstream's `before-input-event` intercepts Escape before the
     /// renderer's own DOM ever sees it, unconditionally, so upstream closes
-    /// the overlay even mid-typing rather than just blurring the field.
+    /// the overlay even while a text field has focus rather than just
+    /// blurring the field — this matches that.
     pub(crate) fn close_overlay(&mut self) {
         self.stop_area_tracker();
         self.set_interactive(false, "Esc");
@@ -840,9 +832,7 @@ impl Overlay {
         }
     }
 
-    /// `pub(crate)`, not private — `tray.rs`'s "Toggle Overlay" menu item
-    /// calls this directly, the same effect as the `toggle-overlay`
-    /// hotkey action.
+    /// The `toggle-overlay` hotkey action.
     pub(crate) fn toggle_overlay(&mut self) {
         // Matches `Shortcuts.ts`'s `toggle-overlay` handler: drop any
         // in-progress hover tracking before flipping state, same as it calls
@@ -854,8 +844,8 @@ impl Overlay {
 
     /// Ports `host.mjs::runPriceCheck()`: find the game window, inject the
     /// copy combo, read back whichever selection the game actually owns,
-    /// broadcast the result, and switch the overlay interactive so it has
-    /// something to show.
+    /// broadcast the result, and — for a `focusOverlay` hotkey only — switch
+    /// the overlay interactive.
     ///
     /// Deliberately does *not* hold `Overlay`'s own lock for the slow part
     /// (the clipboard wait, up to `COPY_ITEM_TIMEOUT`) — only the narrower
@@ -955,9 +945,8 @@ impl Overlay {
         // monitor-local logical pixels (`window.screenX`/`screenY`, always
         // `(0, 0)` on Wayland — see `current_monitor_origin`'s docs), so this
         // has to be converted before it's usable there. Falls back to the
-        // raw global position if the monitor origin can't be resolved (the
-        // pre-existing, less-correct behavior) rather than dropping the
-        // whole price check over it.
+        // raw global position if the monitor origin can't be resolved
+        // rather than dropping the whole price check over it.
         let (ox, oy) = overlay_monitor_origin().await.unwrap_or_else(|| {
             eprintln!(
                 "ee2-hyprland: copy-item: no monitor origin resolved, using unconverted position"
@@ -1014,9 +1003,8 @@ impl Overlay {
     /// `assertGameActive()`, does the same "give focus back to the game"
     /// step via `OverlayController.focusTarget()` before injecting).
     /// `set_interactive(false)`'s passthrough switch marshals onto the GTK
-    /// main thread asynchronously (see `set_passthrough_on_main_thread`),
-    /// so a short delay follows before injecting — not otherwise guarded
-    /// against here.
+    /// main thread asynchronously (see `apply_surface`), so a short delay
+    /// follows before injecting — not otherwise guarded against here.
     async fn run_stash_search(overlay: &Arc<TokioMutex<Overlay>>, text: &str) {
         let (copy_item, restore_enabled, in_flight) = {
             let mut guard = overlay.lock().await;
@@ -1038,25 +1026,17 @@ impl Overlay {
         // keys get injected — same order-of-magnitude as INJECT_STAGGER
         // and upstream's own RESTORE_AFTER, not independently tuned.
         //
-        // **Phase C investigated replacing this with a real event
-        // (PLAN.md) — measured, not swapped in.** The candidate signal was
-        // `gtk4::Window::is-active`/`connect_is_active_notify`, which for a
-        // *toplevel* window does track real wl_keyboard enter/leave. Tested
-        // live against this fork's actual layer-shell window (tray "Toggle
-        // Overlay" over D-Bus, `hyprland/diag/C1_focus_grace/is_active.log`):
-        // the signal never fires at all, through repeated
-        // interactive/passthrough transitions — `gtk_window_is_active`'s
-        // activation tracking is wired to `xdg_toplevel`'s own
-        // ACTIVATED-state protocol, which a `zwlr_layer_surface_v1` role
-        // simply doesn't have, so there's nothing to notify. The only
-        // signal that genuinely reflects our surface's keyboard focus is
-        // the seat's `wl_keyboard.enter`/`leave` themselves, and reaching
-        // those directly would mean a new raw Wayland listener (matching
-        // our own surface's `wl_surface` id against the `Enter`/`Leave`
-        // event's `surface` argument) — real new-subsystem scope, not a
-        // swap-in for one call site. Left as a fixed wait, not because no
-        // better mechanism was considered, but because the one this task
-        // named turned out not to exist for this kind of surface.
+        // **Why not a real event:** the obvious candidate,
+        // `gtk4::Window::is-active`/`connect_is_active_notify` (which for a
+        // *toplevel* does track wl_keyboard enter/leave), never fires on
+        // this layer-shell window — measured through repeated
+        // interactive/passthrough transitions. `gtk_window_is_active` is
+        // wired to `xdg_toplevel`'s ACTIVATED state, which a
+        // `zwlr_layer_surface_v1` role doesn't have. The only signal that
+        // genuinely reflects our surface's keyboard focus is the seat's raw
+        // `wl_keyboard.enter`/`leave` (matching our own `wl_surface` id
+        // against the event's `surface` argument) — a new raw Wayland
+        // listener, not a swap-in for one call site. Hence the fixed wait.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let settled = async {
@@ -1185,10 +1165,10 @@ impl Overlay {
                     // `text-box.ts`) — the KDE fork found this leaves
                     // PoE2's own chat box open on Proton/Wayland instead of
                     // closing it, causing a second send and opening the
-                    // game's own menu. Needs live verification against this
-                    // system's own PoE2 before any tail is added back — see
-                    // PLAN.md's paste-in-chat entry for what was actually
-                    // observed.
+                    // game's own menu. Plain `send: true` commands work
+                    // without it; whether an `@last` reply needs any tail
+                    // has not been checked against the real game (needs an
+                    // incoming whisper) — do that before adding one back.
                 }
                 Ok(())
             }
@@ -1230,11 +1210,9 @@ impl Overlay {
         });
     }
 
-    /// The big dispatcher for everything arriving over WS `/events`. Ports
-    /// `host.mjs`'s `ws.on("message", ...)` switch — same event set, same
-    /// scope (`used-recently`/`write-data`/`re-parse-log`/`render-state`/
-    /// `track-area` are all log-only there too; Stage 5 is where any of
-    /// them might get real handling).
+    /// The dispatcher for everything arriving over WS `/events` (the
+    /// `CLIENT->MAIN::*`/`OVERLAY->MAIN::*` events of `ipc/types.ts`).
+    /// Anything unknown is logged and ignored.
     pub async fn handle_ws_event(&mut self, name: &str, payload: Value) {
         eprintln!("ee2-hyprland: ws in: {name}");
         match name {
@@ -1322,8 +1300,8 @@ impl Overlay {
                     Some("check-for-update") => {
                         // No self-update mechanism in this fork (packaged
                         // and updated like any other native Linux
-                        // package — PLAN.md's packaging stage — not an
-                        // installer with its own updater) — respond the
+                        // package, not an installer with its own
+                        // updater) — respond the
                         // same shape `/config`'s own initial `updater`
                         // value already uses (`server.rs::get_config`), so
                         // Settings' About screen resolves the "Checking…"
@@ -1379,16 +1357,12 @@ impl Overlay {
                 // Sent by `OverlayWindow.vue`'s `handleBackgroundClick`/
                 // `PriceCheckWindow.vue`'s `closePriceCheck` — explicit
                 // "user wants focus back on the game" actions (background
-                // click, closing a widget). Used to be guarded by a
-                // `FOCUS_GAME_GRACE` window (removed, Phase C, PLAN.md):
-                // ported verbatim from the prior prototype on the
-                // assumption that this fork would see the same
-                // post-activation `focus-game` burst that prototype did.
-                // Live-measured across all three activation paths
-                // (`toggle-overlay`, `Ctrl+Alt+D`, `Ctrl+D`+hover) with the
-                // grace disabled and every receipt logged — the burst never
-                // reproduced here, so there was nothing left for the grace
-                // to guard against.
+                // click, closing a widget). Acted on unconditionally, like
+                // upstream's `assertGameActive()`: the spurious
+                // post-activation `focus-game` burst the prior prototype
+                // needed a grace window for does not occur here (measured
+                // across `toggle-overlay`, `Ctrl+Alt+D` and `Ctrl+D`+hover
+                // activations).
                 self.set_interactive(false, "OVERLAY->MAIN::focus-game");
             }
             "OVERLAY->MAIN::render-state" => {
@@ -1396,9 +1370,7 @@ impl Overlay {
                 // a different signal from `focus-game` above (see that
                 // arm's docs): "does any widget currently have visible
                 // content", not "user wants focus back". Hides the layer
-                // surface entirely when nothing has visible content, which
-                // also happens to mask the still-open Stage 1
-                // WebView-transparency issue while idle.
+                // surface entirely when nothing has visible content.
                 let should_show = payload
                     .get("shouldShow")
                     .and_then(Value::as_bool)
@@ -1477,7 +1449,7 @@ impl Overlay {
     }
 }
 
-/// `stashScroll` (Phase C, PLAN.md): ports `Shortcuts.ts`'s Ctrl+wheel
+/// `stashScroll`: ports `Shortcuts.ts`'s Ctrl+wheel
 /// tab-switch injection. `area_tracker.rs` is the one caller — it already
 /// holds only a `Weak<TokioMutex<Overlay>>` (never the strong `Arc`), same
 /// as its existing `set_overlay_interactive`/`broadcast_hide_exclusive_widget`

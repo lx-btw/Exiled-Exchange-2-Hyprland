@@ -1,5 +1,5 @@
-//! Event-driven clipboard read via `zwlr_data_control_manager_v1`, with an
-//! X11-selection fallback for a game running under Xwayland without
+//! Event-driven clipboard read and write via `zwlr_data_control_manager_v1`,
+//! with an X11-selection fallback for a game running under Xwayland without
 //! `PROTON_ENABLE_WAYLAND=1` (gated on `compositor.rs`'s per-client `xwayland`
 //! flag — the same signal upstream's `host.mjs` used).
 //!
@@ -10,28 +10,27 @@
 //! plain Xwayland — sidesteps that entirely, rather than trying to read
 //! whichever side happens to be convenient.
 //!
-//! Improves on the prior prototype's polling approach for the native-Wayland
-//! path: no subprocess spawn per poll tick, no `EE2_FOCUS_GRACE`-style grace
-//! window. `zwlr_data_control_device_v1.selection` fires on every genuine
+//! Native-Wayland reads are event-driven, not polled: no subprocess spawn
+//! per poll tick. `zwlr_data_control_device_v1.selection` fires on every genuine
 //! copy action a native client performs (a fresh offer object each time,
 //! even for back-to-back copies of visually identical text) — there's no
 //! stale-read race to paper over the way polling had, so no "clear the
 //! selection first" step is needed either: the caller just drains whatever
 //! was already buffered, triggers the copy, and awaits the next event.
 //!
-//! The X11 fallback stays a plain `xsel` subprocess call (matching
-//! `host.mjs`), not the minimal-XCB-connection design HYPRLAND-NOTES.md
-//! describes — that's a real scope reduction, not an oversight: this is the
-//! secondary path (only reached when the game runs under Xwayland without
-//! Wayland-native Proton), invoked once per price-check rather than per
-//! keystroke, and X11 doesn't have as convenient an event-subscription
-//! primitive as `zwlr_data_control` to build on. Revisit if the subprocess
-//! spawn turns out to matter in practice.
+//! Native-Wayland writes go through our own `zwlr_data_control_source_v1`
+//! (`run_writer`), no `wl-copy` subprocess.
 //!
-//! Stage 3 (see PLAN.md). Design rationale: HYPRLAND-NOTES.md §5.
-//! Fallback if `wlr-data-control` misbehaves: revert to `wl-paste` polling
-//! after clearing the selection (known to work, just slower) — keep this
-//! module's public interface unchanged either way.
+//! The X11 fallback is a plain `xsel` subprocess call (matching `host.mjs`),
+//! not an XCB client — a deliberate scope choice: this is the secondary
+//! path (only reached when the game runs under Xwayland without
+//! Wayland-native Proton), invoked once per action rather than per
+//! keystroke, and X11 has no event-subscription primitive as convenient as
+//! `zwlr_data_control` to build on. Revisit if the subprocess spawn turns
+//! out to matter in practice; callers only see `xwayland: bool`, so a real
+//! XCB implementation could replace it without touching them.
+//!
+//! Design rationale: HYPRLAND-NOTES.md §5.
 
 use crate::logger::ee_log;
 use std::collections::VecDeque;
@@ -209,17 +208,12 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
 
                 // A selection we ourselves just wrote (`write_text`/
                 // `write_text_restoring`) carries this marker MIME type —
-                // skip reading it back here. Without this, this read loop
-                // would issue its own `Receive` against *every* source we
-                // create (needed so a genuine external copy, e.g. the
-                // game's `Ctrl+Alt+C`, is ever seen at all) — and answering
-                // that `Receive` is exactly what fires the source's `Send`
-                // event, the same signal `Settle` treats as "the game
-                // consumed it". Left unguarded, `Settle` fired within
-                // microseconds of every write regardless of whether
-                // anything external ever actually read it — found via a
-                // flaky test racing exactly this, not anticipated in
-                // advance.
+                // skip reading it back. Otherwise this loop would issue a
+                // `Receive` against every source we create (a round-trip
+                // through our own writer thread), report our own text as a
+                // `ClipboardEvent` (copy-item waits for the *game's* copy),
+                // and overwrite `LAST_TEXT` — which must keep the last
+                // external content for `restoreClipboard`.
                 if mime_types.iter().any(|m| m == OWN_WRITE_MARKER_MIME) {
                     state.current_offer = Some(offer);
                     return;
@@ -528,10 +522,8 @@ impl Dispatch<ZwlrDataControlSourceV1, Mutex<String>> for WriterState {
                 use std::io::Write;
                 let text = text.lock().unwrap().clone();
                 // Closing `file` (end of scope) drops the fd, which is the
-                // EOF signal the reading side (the game, or `read_x11_selection`'s
-                // Wayland-native counterpart) is waiting for — same
-                // write-then-drop shape `write_text`'s xsel/wl-copy subprocess
-                // path already relied on via stdin.
+                // EOF signal the reading side (the game, `wl-paste`, a
+                // clipboard manager) is waiting for.
                 let mut file = std::fs::File::from(fd);
                 if let Err(err) = file.write_all(text.as_bytes()) {
                     ee_log!("clipboard write: failed to write paste data: {err}");
@@ -698,13 +690,11 @@ async fn read_x11_selection() -> io::Result<String> {
 /// the two cases (only reached for a game running under plain Xwayland
 /// without `PROTON_ENABLE_WAYLAND=1`).
 ///
-/// The native-Wayland path (Phase C, PLAN.md) no longer shells out to
-/// `wl-copy` — it hands the text to `run_writer`'s thread over
+/// The native-Wayland path hands the text to `run_writer`'s thread over
 /// `WRITE_QUEUE`, which creates a real `zwlr_data_control_source_v1` on the
 /// connection it already holds open and answers `Send` itself. Thin
 /// fire-and-forget wrapper around `write_text_xwayland`/`write_text_native`
-/// — `write_text_restoring` (Phase D) is the one that also arranges a
-/// later restore.
+/// — `write_text_restoring` is the one that also arranges a later restore.
 pub async fn write_text(text: &str, xwayland: bool) -> io::Result<()> {
     if xwayland {
         write_text_xwayland(text).await
@@ -742,26 +732,18 @@ async fn write_text_xwayland(text: &str) -> io::Result<()> {
 /// — the same fixed-wait approach upstream's `HostClipboard.RESTORE_AFTER`
 /// uses, and the same value (120ms), on **both** paths.
 ///
-/// An earlier version of this tried to be event-driven on the native path:
-/// fire the restore from the write source's own `Send` event instead of
-/// guessing a delay — genuinely a real signal, and it worked... right up
-/// until it was tested against this dev system's own clipboard-history
-/// daemons (`wl-clip-persist` and `wl-paste --watch … | cliphist store`,
-/// confirmed running via `ps aux`), which answer `Receive` against *any*
-/// clipboard write within microseconds — indistinguishable at the protocol
-/// level from the game itself pasting. A Hyprland desktop running a
-/// clipboard-history manager is a common setup, not an edge case (this
-/// session's own dev machine has one), so `Send` can't actually tell "the
-/// game consumed it" apart from "a clipboard-history tool eagerly consumed
-/// it" — the same class of problem upstream's own `HostClipboard.ts`
-/// comments already call out for KDE's "Prevent empty clipboard" feature
-/// and the Proton 10 clipboard bug, just hit here from a different
-/// direction. `current_text()` below is still the event-fed, no-timer,
-/// no-subprocess primitive for "what's on the clipboard right now" — it's
-/// specifically "when has this write been consumed" that turned out to
-/// have no reliable signal at this protocol layer, so restoring falls back
-/// to upstream's own proven fixed wait rather than continuing to chase a
-/// signal that doesn't actually exist here.
+/// Why not event-driven: the obvious signal on the native path — restore
+/// once the write source gets its `Send` event — doesn't mean "the game
+/// pasted it". Clipboard-history daemons (`wl-clip-persist`, `wl-paste
+/// --watch … | cliphist store` — a common Hyprland setup) answer `Receive`
+/// against *any* clipboard write within microseconds, indistinguishable at
+/// the protocol level from the game itself pasting (the same class of
+/// problem upstream's `HostClipboard.ts` comments call out for KDE's
+/// "Prevent empty clipboard" and the Proton 10 clipboard bug). A
+/// `Send`-driven restore was tried and failed exactly this way.
+/// `current_text()` below is still the event-fed, no-timer, no-subprocess
+/// primitive for "what's on the clipboard right now" — only "when has this
+/// write been consumed" has no reliable signal at this protocol layer.
 const RESTORE_AFTER: Duration = Duration::from_millis(120);
 
 /// Writes `text` to the clipboard the game will read from, same as
@@ -807,7 +789,7 @@ pub async fn write_text_restoring(
 /// The native-Wayland write itself — hands `text` to `run_writer`'s thread
 /// over `WRITE_QUEUE`, which creates a real `zwlr_data_control_source_v1`
 /// on the connection it already holds open and answers `Send` itself (no
-/// `wl-copy` subprocess, Phase C, PLAN.md). Split out of `write_text`/
+/// `wl-copy` subprocess). Split out of `write_text`/
 /// `write_text_restoring` since both need exactly this, with nothing else
 /// attached.
 async fn write_text_native(text: &str) -> io::Result<()> {
@@ -902,14 +884,11 @@ mod tests {
     /// every test here does throughout.
     static CLIPBOARD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    /// Phase C (PLAN.md): `write_text`'s native-Wayland path used to shell
-    /// out to `wl-copy` per call; it now creates its own
-    /// `zwlr_data_control_source_v1` on `run_writer`'s connection. This is
-    /// the round-trip check that replaces "read it back with `wl-paste`
-    /// after a manual `wl-copy`" manual testing — needs a live compositor
-    /// with a seat and `wlr-data-control` support (true of the dev/CI
-    /// Hyprland session this runs on; skips gracefully if `wl-paste`
-    /// itself can't run at all, e.g. no `WAYLAND_DISPLAY`).
+    /// `write_text`'s native-Wayland path creates its own
+    /// `zwlr_data_control_source_v1` on `run_writer`'s connection instead of
+    /// spawning `wl-copy`. Round-trip check against the real clipboard —
+    /// needs a live compositor with a seat and `wlr-data-control` support
+    /// (a Hyprland session) and `wl-paste` on `PATH`.
     #[tokio::test]
     async fn write_text_round_trips_without_a_wl_copy_subprocess() {
         let _guard = CLIPBOARD_TEST_LOCK.lock().await;
@@ -951,9 +930,8 @@ mod tests {
         assert!(output.status.success(), "wl-paste failed: {output:?}");
         assert_eq!(String::from_utf8_lossy(&output.stdout), marker);
 
-        // The whole point of Phase C: no *new* `wl-copy` subprocess exists
-        // to serve this selection — `run_writer`'s own source answered
-        // `wl-paste`'s `Receive` directly.
+        // No *new* `wl-copy` subprocess exists to serve this selection —
+        // `run_writer`'s own source answered `wl-paste`'s `Receive` directly.
         let after = wl_copy_pids().await;
         assert_eq!(
             before, after,
@@ -961,18 +939,13 @@ mod tests {
         );
     }
 
-    /// The restoreClipboard mechanism (PLAN.md): confirms both halves of
+    /// The restoreClipboard mechanism: confirms both halves of
     /// `write_text_restoring` against the real system clipboard — the new
     /// text is actually readable immediately after the write, and the
     /// previous value lands back on the clipboard `RESTORE_AFTER` later.
-    /// This system runs real clipboard-history watchers
-    /// (`wl-clip-persist`/`wl-paste --watch … | cliphist store`, confirmed
-    /// via `ps aux` — see `RESTORE_AFTER`'s docs) that read every selection
-    /// change within microseconds, which is exactly what ruled out an
-    /// earlier `Send`-event-driven version of this mechanism; this test's
-    /// own `wl-paste` read exercises the same "something external reads it
-    /// almost immediately" condition and confirms the fixed-wait design
-    /// isn't thrown off by it either.
+    /// This test's own `wl-paste` read (like a clipboard-history watcher,
+    /// see `RESTORE_AFTER`'s docs) reads the selection almost immediately;
+    /// the fixed-wait design must not be thrown off by that.
     #[tokio::test]
     async fn write_text_restoring_restores_after_the_wait() {
         let _guard = CLIPBOARD_TEST_LOCK.lock().await;

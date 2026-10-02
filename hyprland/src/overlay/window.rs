@@ -14,17 +14,15 @@
 //!   (non-nullable) Python/cairo bindings required, even though this Rust
 //!   binding's signature technically allows it.
 //! - **Input region and keyboard mode are two independent knobs, not one**
-//!   (split 2026-09-24, H2B — see `state.rs`'s `apply_keyboard_mode`). The
-//!   input region still just follows interactive/passthrough, same as
-//!   always; keyboard mode additionally depends on whether an input element
-//!   *inside* the WebView currently has focus (`webview.rs`'s
-//!   focusin/focusout bridge), so the overlay can be mouse-interactive
-//!   (full input region) while the game still receives keyboard input by
-//!   default — only actually typing into a field inside the overlay steals
-//!   the keyboard. `set_keyboard_mode` here still only ever chooses between
-//!   `None` and `Exclusive`, never `OnDemand`, same invariant as always.
+//!   (see `state.rs`'s `apply_keyboard_mode`). The input region follows
+//!   interactive/passthrough; keyboard mode additionally depends on whether
+//!   an input element *inside* the WebView has focus or the pointer is over
+//!   a widget (`webview.rs`'s focus/hover bridges), so the overlay can be
+//!   mouse-interactive (full input region) while the game still receives
+//!   keyboard input over the transparent background. `set_keyboard_mode`
+//!   only ever chooses between `None` and `Exclusive`, never `OnDemand`.
 //!
-//! Stage 1 (see PLAN.md). Design rationale: HYPRLAND-NOTES.md §6.
+//! Design rationale: HYPRLAND-NOTES.md §6.
 //! Fallback if WebKit6 mis-renders the upstream renderer: this module (and
 //! `webview.rs`) is the only thing that changes to switch engines — swap for
 //! C++/Qt6 + QtWebEngine + LayerShellQt. Everything downstream (`server.rs`,
@@ -39,29 +37,22 @@ use webkit6::WebView;
 
 /// Builds the layer-shell overlay window and mounts `webview` inside it.
 /// Starts in passthrough mode — nothing steals input until something (a
-/// hotkey, Stage 2+) switches it to interactive.
+/// hotkey, a click on a widget) switches it to interactive.
 ///
-/// **The Stage 1 WebView-transparency bug is fixed (Phase A, 2026-09-24;
-/// see PLAN.md).** Root cause: the system GTK4 theme's
-/// `~/.config/gtk-4.0/gtk.css` unconditionally paints `.background` (a CSS
-/// class every top-level `GtkWindow` gets) fully opaque
-/// (`background-color: #1e1e2e`). That's a real, correctly-rendered opaque
-/// pixel in this window's own buffer, so GDK's Wayland backend correctly
-/// reports it to the compositor via `wl_surface.set_opaque_region` covering
-/// the whole surface — confirmed with `WAYLAND_DEBUG=1`: without this fix, a
-/// `wl_region.add(0, 0, <monitor W>, <monitor H>)` +
-/// `wl_surface.set_opaque_region(...)` is sent right before every commit;
-/// with it, `set_opaque_region` is never sent at all (GDK computes there's
-/// no opaque content and lets the Wayland-spec no-opaque-region default
-/// apply), and Hyprland correctly alpha-blends. This was never a Hyprland
-/// occlusion-culling behavior, a "stuck"/unclearable opaque region, or a
-/// WebKit/GSK alpha-channel problem — see PLAN.md's Phase A writeup for the
-/// full trace and the (surprisingly wrong) earlier hypotheses this rules
-/// out. The `CssProvider` below defeats that theme rule the standard GTK
-/// way (a `STYLE_PROVIDER_PRIORITY_USER` provider outranks the theme's
-/// `PRIORITY_THEME` one for the same selector), which is what makes this a
-/// clean fix through GTK's own public behavior rather than a
-/// protocol-level workaround.
+/// **Opaque theme background.** A GTK4 theme may paint `.background` (a CSS
+/// class every top-level `GtkWindow` gets) fully opaque — e.g. a Catppuccin
+/// `~/.config/gtk-4.0/gtk.css` sets `background-color: #1e1e2e`. That is a
+/// real opaque pixel in this window's own buffer, so GDK's Wayland backend
+/// correctly reports it via `wl_surface.set_opaque_region` covering the
+/// whole surface (visible with `WAYLAND_DEBUG=1`: `wl_region.add(0, 0,
+/// <monitor W>, <monitor H>)` + `set_opaque_region` before every commit),
+/// and Hyprland correctly stops compositing what's underneath — the whole
+/// monitor turns into a solid backdrop. With the `CssProvider` below,
+/// `set_opaque_region` is never sent and Hyprland alpha-blends. It's not a
+/// Hyprland occlusion bug or a WebKit/GSK alpha problem. The provider
+/// defeats the theme rule the standard GTK way (`STYLE_PROVIDER_PRIORITY_USER`
+/// outranks the theme's `PRIORITY_THEME` for the same selector) — GTK's own
+/// public mechanism, not a protocol-level workaround.
 pub fn build(app: &gtk4::Application, webview: &WebView) -> gtk4::ApplicationWindow {
     let window = gtk4::ApplicationWindow::builder()
         .application(app)
@@ -101,8 +92,8 @@ pub fn build(app: &gtk4::Application, webview: &WebView) -> gtk4::ApplicationWin
 
 /// Toggles the surface's input region between empty (mouse passes through
 /// to the game underneath) and full-window (overlay is mouse-interactive).
-/// Split from keyboard mode (`set_keyboard_mode`, below) — see module docs'
-/// H2B entry for why they're no longer one call.
+/// Independent of keyboard mode (`set_keyboard_mode`, below) — see module
+/// docs.
 pub fn set_input_region(window: &gtk4::ApplicationWindow, passthrough: bool) {
     let Some(surface) = window.surface() else {
         return;
@@ -156,9 +147,9 @@ pub fn set_keyboard_mode(window: &gtk4::ApplicationWindow, exclusive: bool) {
 /// renderer's own signal for "is there any widget content visible right
 /// now" (`OverlayWindow.vue`'s `isOverlayVisible`), not to be confused with
 /// interactive-vs-passthrough. Also a safety net independent of the
-/// transparency fix above: an unmapped layer surface shows nothing at all,
-/// so any future rendering regression stays invisible instead of painting
-/// over the desktop/game.
+/// opaque-background fix above: an unmapped layer surface shows nothing at
+/// all, so any future rendering regression stays invisible instead of
+/// painting over the desktop/game.
 pub fn set_visible(window: &gtk4::ApplicationWindow, visible: bool) {
     if window.is_visible() != visible {
         eprintln!("ee2-hyprland: surface: visible={visible}");
@@ -166,9 +157,9 @@ pub fn set_visible(window: &gtk4::ApplicationWindow, visible: bool) {
     window.set_visible(visible);
 }
 
-/// The monitor this window's surface actually landed on — since `main.rs`
-/// never calls `set_monitor`, that's whichever output the compositor
-/// assigned the layer surface by default. Falls back to the display's first
+/// The monitor this window's surface actually landed on — the game's
+/// monitor once `set_monitor_by_origin` has pinned it, otherwise whichever
+/// output the compositor assigned by default. Falls back to the display's first
 /// monitor if the surface isn't realized yet (mirrors
 /// `window_size_or_monitor_fallback`'s own fallback).
 fn current_monitor(window: &gtk4::ApplicationWindow) -> Option<gdk::Monitor> {
@@ -200,9 +191,9 @@ fn window_size_or_monitor_fallback(window: &gtk4::ApplicationWindow) -> Option<(
 /// e.g. `(0, 155)` for a `DP-1` sitting above a shorter second monitor.
 /// `compositor::cursor_pos()` and `hyprctl monitors`/`clients` all report
 /// positions in this global frame, but WebKit's `window.screenX`/`screenY`
-/// on our layer-shell surface are **always `(0, 0)`** — confirmed live
-/// (2026-09-24, Stage 5 hover-price-check work): Wayland doesn't expose a
-/// client's absolute on-screen position to its own content, by design. So
+/// on our layer-shell surface are **always `(0, 0)`** (measured with a JS
+/// probe): Wayland doesn't expose a client's absolute on-screen position to
+/// its own content, by design. So
 /// `PriceCheckWindow.vue`'s `area`/`from` math (built from `window.screenX`
 /// and `window.innerWidth`) operates in *monitor-local* logical pixels, and
 /// `state.rs` has to convert `item-text.position` into that same frame

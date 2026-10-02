@@ -1,7 +1,6 @@
-//! Hotkey listening (`hotkeys.rs`), key injection (`inject.rs`), and the
-//! shortcut-string ↔ evdev-keycode table (`keymap.rs`) they share.
-//!
-//! Stage 2 (see PLAN.md).
+//! Hotkey listening and keyd-style capture (`hotkeys.rs`, `grab.rs`), key
+//! injection (`inject.rs`), and the shortcut-string ↔ evdev-keycode table
+//! (`keymap.rs`) they share.
 
 mod grab;
 pub mod hotkeys;

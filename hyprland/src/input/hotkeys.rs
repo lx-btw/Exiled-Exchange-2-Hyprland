@@ -1,21 +1,17 @@
 //! evdev hotkey listener **and** keyd-style input capture. Opens
 //! `/dev/input/event*` for every device that looks like a keyboard (see
-//! `open_keyboards()`) and watches for the configured combos — but now also
+//! `open_keyboards()`) and watches for the configured combos, and
 //! `EVIOCGRAB`s each one (via `grab.rs::Capture`) while the game is
 //! focused, re-emitting everything through a separate `uinput` mirror
 //! device except the matched trigger key of a fired hotkey.
 //!
 //! **Capture policy — read this before changing anything here or in
-//! `grab.rs`.** Corrected 2026-09-24: earlier revisions of this file,
-//! `CLAUDE.md`, and `HYPRLAND-NOTES.md` §3 stated a blanket "never
-//! `EVIOCGRAB`" rule. That was a misreading of the actual constraint — the
-//! real, still-load-bearing rule is narrower: this app never touches
-//! Hyprland's own *config* (no `bind`, no `windowrule`, no `keyword`, no
-//! `hyprctl keyword`/`eval`), not that it never grabs a device. Without a
-//! grab, a hotkey's own trigger key (`D` in `Ctrl+D`, `Space` in
-//! `Shift+Space`) still reached the game underneath and performed whatever
-//! it's bound to there (a step, a dodge-roll) on *every* press — see
-//! PLAN.md's H2 entry.
+//! `grab.rs`.** The hard rule is that this app never touches Hyprland's
+//! own *config* (no `bind`, no `windowrule`, no `keyword`, no `hyprctl
+//! keyword`/`eval`) — not that it never grabs a device. Without a grab, a
+//! hotkey's own trigger key (`D` in `Ctrl+D`, `Space` in `Shift+Space`)
+//! reaches the game underneath and performs whatever it's bound to there
+//! (a step, a dodge-roll) on *every* press.
 //!
 //! - Only real hardware keyboards are ever grabbed — never `inject.rs`'s
 //!   injection device or `grab.rs`'s own mirror device (both excluded by
@@ -23,12 +19,11 @@
 //!   injector before capture existed). The mouse is never grabbed (it
 //!   isn't enumerated here at all — see `open_keyboards()`'s `KEY_A`
 //!   filter).
-//! - Grab is active only while the game is focused — `game_active` is now
-//!   a `watch::Receiver<bool>` rather than the old `Arc<AtomicBool>`; the
-//!   switch to `watch` is what lets this loop react to a focus change
+//! - Grab is active only while the game is focused — `game_active` is a
+//!   `watch::Receiver<bool>` so this loop reacts to a focus change
 //!   immediately (via `select!`), instead of only noticing on the next
-//!   keystroke, which would otherwise leak exactly the first press after
-//!   every alt-tab back into the game.
+//!   keystroke, which would leak exactly the first press after every
+//!   alt-tab back into the game.
 //! - A grab/ungrab transition only happens at a moment nothing is held on
 //!   that specific device — checked against this loop's own per-`(fd,
 //!   code)` `held` set, filtered to one device. If something's held when
@@ -46,7 +41,7 @@
 //!   own trigger-key press, its repeats, and its release; every modifier
 //!   key passes through untouched, on every device, always.
 //! - Per-device XKB layout (`us,ru` / `grp:alt_shift_toggle`) is
-//!   synchronized at each transition (`grab.rs`, HYPRLAND-NOTES.md §9), so
+//!   synchronized at each transition (`grab.rs`, HYPRLAND-NOTES.md §8), so
 //!   a device grabbed mid-`ru` doesn't suddenly type through the mirror's
 //!   own independent (always `us`-default) XKB state, and releasing the
 //!   grab hands the physical device back whatever layout the user last
@@ -60,12 +55,11 @@
 //!   builder API has no way to declare `EV_LED` capability without an
 //!   `unsafe` ioctl call this codebase doesn't otherwise need).
 //!
-//! Everything below is unchanged from before capture existed: modifier
-//! state is still merged across every open keyboard device into one
+//! Modifier state is merged across every open keyboard device into one
 //! logical state machine — held keys tracked per `(device, keycode)` pair
 //! rather than a shared bitset, so releasing a modifier on one keyboard
 //! can't spuriously clear it while a second physical keyboard still holds
-//! its own copy — and matching is still **exact modifier-set equality**,
+//! its own copy — and matching is **exact modifier-set equality**,
 //! not "at least these held": upstream's `globalShortcut.register()` treats
 //! `"Ctrl + D"` and `"Ctrl + Alt + D"` as independent accelerators, so
 //! pressing Ctrl+Alt+D must not also fire a registered "Ctrl + D".
@@ -74,9 +68,7 @@
 //! but the registration mechanism (`globalShortcut`) is not — this never
 //! registers a bind with the compositor, it captures at the evdev layer.
 //!
-//! Stage 2/5, H2A (see PLAN.md). Design rationale: HYPRLAND-NOTES.md §3, §9.
-//! Fallback if merging modifier state across multiple keyboards proves
-//! unreliable: track only the device that produced the last keydown.
+//! Design rationale: HYPRLAND-NOTES.md §3, §8.
 
 use crate::logger::ee_log;
 use std::collections::HashSet;
@@ -147,9 +139,8 @@ impl ModifierState {
 /// letter/modifier capability set a real keyboard does, so without this
 /// exclusion every key either of them emits would loop right back into the
 /// matcher below (and, for capture, straight back into the grab-candidate
-/// list as if a second physical keyboard had appeared) — the exact
-/// self-triggering feedback loop PLAN.md documents as an already-happened
-/// real bug for `inject.rs`'s device (Stage 2 review).
+/// list as if a second physical keyboard had appeared) — a self-triggering
+/// feedback loop.
 fn open_keyboards() -> Vec<Device> {
     evdev::enumerate()
         .filter_map(|(_path, device)| {
@@ -171,9 +162,8 @@ fn open_keyboards() -> Vec<Device> {
 /// action list — read fresh on every keydown, so updating it takes effect
 /// immediately) across every keyboard device present at startup, and sends
 /// the matching index over `tx` each time one fires. Runs until every
-/// keyboard device errors out or is unplugged (this doesn't watch for
-/// hotplugged devices — see module docs' fallback note if that turns out to
-/// matter in practice).
+/// keyboard device errors out or is unplugged (devices plugged in after
+/// startup are not picked up until a restart).
 ///
 /// `game_active` (`state.rs`'s `hotkeys_active`, updated from
 /// `set_game_active`) gates both matching and capture: ports upstream's
@@ -185,7 +175,7 @@ fn open_keyboards() -> Vec<Device> {
 /// stays accurate for whenever the game becomes active again.
 ///
 /// `overlay_interactive` (`state.rs`'s `Overlay.overlay_interactive_tx`) and
-/// `close_overlay_tx` are H2B's `Esc` handling (see the `KEY_ESC` case
+/// `close_overlay_tx` are the `Esc` handling (see the `KEY_ESC` case
 /// below) — `Esc` isn't in `bindings` at all (it isn't a user-configurable
 /// shortcut upstream either; `OverlayWindow.ts` hardcodes it separately
 /// from `Shortcuts.ts`), so it gets its own watch channel to read and its
@@ -206,10 +196,10 @@ pub async fn watch(
 
     // `Capture::new` needs to read every device's name/capabilities before
     // any of them are moved into their own reader task below. A failure
-    // here (uinput unavailable, permission denied) degrades to the
-    // pre-capture behavior — hotkeys still match and fire, they just never
-    // grab anything and the H2 leak-on-first-press bug is back — rather
-    // than taking the whole hotkey listener down with it.
+    // here (uinput unavailable, permission denied) degrades to no capture
+    // — hotkeys still match and fire, they just never grab anything, so a
+    // hotkey's trigger key also reaches the game — rather than taking the
+    // whole hotkey listener down with it.
     let mut capture = match Capture::new(&devices) {
         Ok(capture) => Some(capture),
         Err(err) => {
@@ -303,8 +293,7 @@ pub async fn watch(
 
     // Engage capture immediately if the game is already focused when this
     // starts — don't wait for the first keystroke to notice (that keystroke
-    // would otherwise leak straight through, the exact H2 bug this exists
-    // to fix).
+    // would otherwise leak straight through to the game).
     if let Some(capture) = capture.as_mut() {
         let active = *game_active.borrow();
         capture.recheck_all(&fds, active, &held).await;
@@ -366,7 +355,7 @@ pub async fn watch(
                                 }
                             }
 
-                            // H2B: `Esc` always closes an interactive
+                            // `Esc` always closes an interactive
                             // overlay — a bare press only (no modifiers),
                             // matching upstream's `handleExtraCommands`
                             // switch, which compares against the literal

@@ -5,13 +5,10 @@
 //! `hotkeys.rs`'s module docs for the full capture policy (what gets
 //! grabbed, when, and why) — this module is the "how", not the "whether".
 //!
-//! Design rationale: `HYPRLAND-NOTES.md` §3 (capture policy) and §9
-//! (per-device XKB layout sync — includes the two things confirmed live
-//! against this system rather than assumed: the Hyprland device-name
+//! Design rationale: `HYPRLAND-NOTES.md` §3 (capture policy) and §8
+//! (per-device XKB layout sync — including the Hyprland device-name
 //! mangling `hypr_device_name()` reproduces, and why `switchxkblayout` has
-//! to be sent without a `dispatch` prefix on this system's config).
-//!
-//! Stage 5, H2A (see PLAN.md).
+//! to be sent without a `dispatch` prefix).
 
 use crate::logger::ee_log;
 use std::collections::{HashMap, HashSet};
@@ -85,9 +82,9 @@ impl Mirror {
 /// trimmed. Needed because `compositor::keyboards()`/`switchxkblayout`
 /// address a device by this mangled name, but `evdev::Device::name()`
 /// returns the raw kernel name, and there's no vid/pid/phys field in
-/// `hyprctl -j devices`'s JSON to join on instead. Confirmed empirically
-/// against this system's live `hyprctl -j devices` output (2026-09-24, see
-/// this function's own unit test) — not assumed from source.
+/// `hyprctl -j devices`'s JSON to join on instead. Checked against real
+/// `hyprctl -j devices` output (see this function's unit test), not
+/// derived from Hyprland's source.
 fn hypr_device_name(evdev_name: &str) -> String {
     let mut out = String::with_capacity(evdev_name.len());
     let mut last_was_dash = true; // swallow leading separators
@@ -115,15 +112,11 @@ async fn sync_mirror_to_physical(hypr_name: &str) {
         Ok(list) => match list.iter().find(|d| d.name == hypr_name) {
             Some(dev) => {
                 // `switchxkblayout` addresses devices by Hyprland's own
-                // mangled name, same as `j/devices` reports them — a plain
+                // mangled name, same as `j/devices` reports them — the raw
                 // `MIRROR_KEYBOARD_NAME` (with a literal space) never
-                // matches anything, confirmed live (2026-09-24, H2A
-                // verification): the raw constant was used here
-                // unmangled, so this call silently targeted a
-                // nonexistent device name every single time (Hyprland's
-                // socket still replies without an IO error, so nothing
-                // surfaced it) — caught only via the *other* direction's
-                // symmetric lookup logging "mirror device not found".
+                // matches anything, and Hyprland replies without an error
+                // for a nonexistent device, so an unmangled name here
+                // would fail silently.
                 if let Err(err) = compositor::switchxkblayout(
                     &hypr_device_name(MIRROR_KEYBOARD_NAME),
                     dev.active_layout_index,
@@ -312,8 +305,8 @@ mod tests {
 
     #[test]
     fn matches_live_hyprland_device_names() {
-        // Captured live from this system's `hyprctl -j devices`
-        // (2026-09-24) — not guessed at from the mangling algorithm alone.
+        // Real names from `hyprctl -j devices` — not guessed at from the
+        // mangling algorithm alone.
         assert_eq!(
             hypr_device_name("SteelSeries SteelSeries Apex 7 TKL"),
             "steelseries-steelseries-apex-7-tkl"
@@ -325,16 +318,11 @@ mod tests {
         assert_eq!(hypr_device_name("Power Button"), "power-button");
     }
 
-    /// Regression test for a real bug found in the first live H2A
-    /// verification (2026-09-24): `sync_mirror_to_physical`/
-    /// `sync_physical_to_mirror` used to compare against the raw
-    /// `MIRROR_KEYBOARD_NAME` constant (a literal space in it) instead of
-    /// its mangled form — so the mirror device was never found in
-    /// `j/devices`, and `switchxkblayout` was never once sent a name that
-    /// resolved to anything, on every single one of 15 real grab/ungrab
-    /// cycles in that session's log. Both call sites now go through
-    /// `hypr_device_name` — this pins the exact mangled string they
-    /// resolve to.
+    /// `sync_mirror_to_physical`/`sync_physical_to_mirror` must look the
+    /// mirror up by its mangled name — the raw `MIRROR_KEYBOARD_NAME` (a
+    /// literal space in it) never matches anything in `j/devices`, which
+    /// silently breaks the layout sync. This pins the exact mangled string
+    /// both call sites resolve to.
     #[test]
     fn mirror_name_is_mangled_before_use() {
         assert_eq!(

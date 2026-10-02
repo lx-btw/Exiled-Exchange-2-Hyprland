@@ -10,18 +10,14 @@
 //!
 //! Also `GameConfig`: reads `poe2_production_Config.ini` for `showModsKey`
 //! (`ACTION_KEYS.show_advanced_item_descriptions`) — ported from upstream's
-//! `main/src/host-files/GameConfig.ts`. Verified against a real installed
-//! copy of this file on this system (Steam+Proton, App ID 2694490): UTF-8
-//! BOM at the start (upstream's `contents.trimStart()` comment — "remove
-//! BOM" — is not a hypothetical), `[ACTION_KEYS]`/`[WASD_ACTION_KEYS]` as
-//! separate sections (only `[ACTION_KEYS]` is upstream's source of truth,
-//! `[WASD_ACTION_KEYS]` is a different keybind profile and ignored, same as
-//! upstream), and `show_advanced_item_descriptions=18` in its default,
-//! unrebound state — `18` being the Windows virtual-key code for Alt (see
-//! `ipc/KeyToCode.ts`), confirming the default really does round-trip to
-//! this fork's own hardcoded `Alt` default.
-//!
-//! Stage 0/2/4/5 (see PLAN.md).
+//! `main/src/host-files/GameConfig.ts`. Facts about the real file
+//! (Steam+Proton install, App ID 2694490): it starts with a UTF-8 BOM
+//! (upstream's `contents.trimStart()` — "remove BOM"), `[ACTION_KEYS]` and
+//! `[WASD_ACTION_KEYS]` are separate sections (only `[ACTION_KEYS]` is the
+//! source of truth, same as upstream; `[WASD_ACTION_KEYS]` is a different
+//! keybind profile), and an unrebound `show_advanced_item_descriptions=18`
+//! — `18` being the Windows virtual-key code for Alt (`ipc/KeyToCode.ts`),
+//! i.e. this fork's `Alt` default.
 
 use std::io;
 use std::path::PathBuf;
@@ -114,8 +110,7 @@ impl Default for ConfigStore {
 /// Same Linux candidate paths upstream's `GameConfig.ts` tries when the
 /// renderer hasn't told us an explicit path via `HostConfig.gameConfig`:
 /// the standalone client under `~/Documents`, or Steam+Proton's compat
-/// prefix for PoE2's own App ID (`2694490` — the same one
-/// `compositor.rs::game_class()` defaults to).
+/// prefix for PoE2's own App ID (`2694490`).
 fn candidate_game_config_paths() -> Vec<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     vec![
@@ -282,9 +277,9 @@ mod tests {
 
     #[test]
     fn default_alt_binding_parses() {
-        // The exact line this system's real, installed poe2_production_Config.ini
-        // has for an unrebound `show_advanced_item_descriptions` — verified
-        // live against that file, see module docs.
+        // The exact line a real, installed poe2_production_Config.ini has
+        // for an unrebound `show_advanced_item_descriptions` — see module
+        // docs.
         let ini = "[ACTION_KEYS]\nshow_advanced_item_descriptions=18\n";
         let raw = find_show_mods_key_value(ini).unwrap();
         assert_eq!(modifier_from_ini_value(&raw), Some(Modifier::Alt));

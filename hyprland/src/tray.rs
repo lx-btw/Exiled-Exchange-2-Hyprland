@@ -5,11 +5,9 @@
 //! item just shows a dialog telling the user to press the overlay hotkey
 //! in-game; here it is a desktop notification (`org.freedesktop.Notifications`
 //! via gio's D-Bus API) with the same text. Like upstream, the tray never
-//! opens the overlay itself — since Session 18 the surface only exists
-//! while the game is on screen, so "Open in Browser" is the way to reach
-//! the settings without the game.
-//!
-//! Stage 5 (see PLAN.md).
+//! opens the overlay itself — the surface only exists while the game is on
+//! screen, so "Open in Browser" is the way to reach the settings without
+//! the game.
 
 use std::path::PathBuf;
 
@@ -141,9 +139,9 @@ impl ksni::Tray for AppTray {
             StandardItem {
                 label: "Quit".into(),
                 // Same as CLIENT->MAIN::user-action{action:"quit"} —
-                // immediate process exit, not a graceful GTK shutdown (see
-                // state.rs's own handler for why that's an accepted,
-                // documented scope limit for now).
+                // immediate process exit, not a graceful GTK shutdown.
+                // Nothing needs cleaning up: evdev grabs and uinput devices
+                // are fd-scoped and released by the kernel on exit.
                 activate: Box::new(|_tray: &mut Self| {
                     std::process::exit(0);
                 }),

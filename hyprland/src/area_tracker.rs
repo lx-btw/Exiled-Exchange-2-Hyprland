@@ -12,12 +12,12 @@
 //! one is pending, only the latest one is answered once the in-flight query
 //! returns (no polling timer, no fixed interval — purely event-driven).
 //!
-//! Devices are opened read-only, never `EVIOCGRAB`'d — same rule as
-//! `input/hotkeys.rs`, and for the same reason: the game must keep seeing
-//! every mouse event completely normally.
+//! Mouse devices are opened read-only and never `EVIOCGRAB`'d (only
+//! keyboards are captured, see `input/hotkeys.rs`): the game must keep
+//! seeing every mouse event completely normally.
 //!
-//! Stage 5 (see PLAN.md). Design rationale: HYPRLAND-NOTES.md, `CLAUDE.md`'s
-//! "hotkeys are read, never grabbed" rule.
+//! Also reads `REL_WHEEL` off the same devices for `stashScroll`
+//! (`handle_wheel`).
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
@@ -104,9 +104,8 @@ enum DeviceMsg {
     Motion,
     Click,
     /// Raw `REL_WHEEL` value (sign is direction, matching upstream's
-    /// `UiohookWheelEvent.rotation` — see `handle_wheel`). `stashScroll`
-    /// (Phase C, PLAN.md): reads the same mouse devices this module already
-    /// opens for hover tracking, so no new device-open logic for it.
+    /// `UiohookWheelEvent.rotation` — see `handle_wheel`), for
+    /// `stashScroll`.
     Wheel(i32),
     Closed,
 }
@@ -219,7 +218,7 @@ fn is_stash_area(cursor: (f64, f64), at: (i32, i32), size: (i32, i32)) -> bool {
     cy > by + bh * 154.0 / 1600.0 && cy < by + bh * 1192.0 / 1600.0
 }
 
-/// `stashScroll` (Phase C, PLAN.md): ports `Shortcuts.ts`'s `wheel` handler
+/// `stashScroll`: ports `Shortcuts.ts`'s `wheel` handler
 /// — `Ctrl` held, the game focused, the feature enabled in config, and the
 /// cursor *outside* the stash grid itself (`is_stash_area`, above) all have
 /// to hold before a wheel notch becomes an `ArrowLeft`/`ArrowRight` tap.
@@ -279,8 +278,7 @@ async fn handle_wheel(delta: i32, modifiers: &ModifierState, overlay: &Weak<Toki
 
 /// Runs until `cmd_rx` closes (process shutdown). Owns every mouse-like
 /// input device found at startup — like `hotkeys::watch`, this doesn't
-/// handle hotplugged devices (see that module's docs for the same
-/// known-gap/fallback note).
+/// handle devices plugged in later.
 pub async fn watch(
     overlay: Weak<TokioMutex<Overlay>>,
     modifiers: Arc<ModifierState>,
@@ -418,9 +416,9 @@ mod tests {
     use super::*;
 
     // `at`/`size` are the real numbers `hyprctl clients -j` reported for a
-    // live PoE2 window on this system's `DP-1` (`hyprland/diag/`, Phase C
-    // session) — not synthetic, so this locks in the exact geometry
-    // `is_stash_area` has to reproduce from upstream's `isStashArea`.
+    // fullscreen PoE2 window on a 2560x1440 monitor at origin (0, 155) —
+    // not synthetic, so this locks in the exact geometry `is_stash_area`
+    // has to reproduce from upstream's `isStashArea`.
     const AT: (i32, i32) = (0, 155);
     const SIZE: (i32, i32) = (2560, 1440);
 

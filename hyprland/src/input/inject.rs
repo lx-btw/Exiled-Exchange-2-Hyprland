@@ -3,9 +3,8 @@
 //! `grp:alt_shift_toggle` setup entirely, since layout switching is
 //! per-physical-device and a virtual device that never sends an
 //! Alt+Shift-toggle sequence of its own simply never leaves XKB group 0
-//! ("us", the first configured layout) — no special pinning code needed,
-//! this was already verified empirically on this system by the prior
-//! prototype.
+//! ("us", the first configured layout) — no special pinning code needed
+//! (verified empirically by the prior prototype).
 //!
 //! `Ctrl+<showModsKey>+C` sequence (not just `Ctrl+C` — the game's own
 //! `show_advanced_item_descriptions` modifier, `Alt` by default, must be
@@ -14,7 +13,7 @@
 //! already empirically tuned: `LEFTCTRL+<mods> down, wait 30ms, C down,
 //! wait 30ms, C up, wait 30ms, <mods>+LEFTCTRL up`. `showModsKey` is read
 //! from the user's actual `poe2_production_Config.ini` (`config.rs`'s
-//! `GameConfig`, Stage 5) rather than assumed — `copy_item()` takes it as a
+//! `GameConfig`) rather than assumed — `copy_item()` takes it as a
 //! parameter, called fresh each time from whatever `state.rs` currently has
 //! on file.
 //!
@@ -22,7 +21,7 @@
 //! known-broken on Hyprland for this (desynced modifier state / dropped
 //! modifiers, respectively). Do not reintroduce either.
 //!
-//! Stage 2/5 (see PLAN.md). Design rationale: HYPRLAND-NOTES.md §4.
+//! Design rationale: HYPRLAND-NOTES.md §4.
 
 use std::io;
 use std::time::Duration;
@@ -154,7 +153,7 @@ impl VirtualKeyboard {
         Ok(())
     }
 
-    /// `stashScroll` (Phase C, PLAN.md): ports `Shortcuts.ts`'s Ctrl+wheel
+    /// `stashScroll`: ports `Shortcuts.ts`'s Ctrl+wheel
     /// tab-switch — a bare `ArrowRight`/`ArrowLeft` tap, no modifier
     /// (`Ctrl` is the *trigger* condition `area_tracker.rs` already checked
     /// before calling this, not part of the injected combo itself, matching
