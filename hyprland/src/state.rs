@@ -113,7 +113,9 @@ fn apply_keyboard_mode() {
 /// focus too, matching how a real desktop app's focus state persists across
 /// a window being hidden and shown again.
 pub fn set_input_focused(focused: bool) {
-    INPUT_FOCUSED.with(|f| f.set(focused));
+    if INPUT_FOCUSED.with(|f| f.replace(focused)) != focused {
+        eprintln!("ee2-hyprland: webview input focused: {focused}");
+    }
     apply_keyboard_mode();
 }
 
@@ -122,6 +124,7 @@ pub fn set_input_focused(focused: bool) {
 /// mode change on an actual transition.
 pub fn set_pointer_over_widget(over: bool) {
     if POINTER_OVER_WIDGET.with(|p| p.replace(over)) != over {
+        eprintln!("ee2-hyprland: webview pointer over widget: {over}");
         apply_keyboard_mode();
     }
 }
@@ -553,6 +556,10 @@ impl Overlay {
     }
 
     fn send_focus_change(&self, using_hotkey: bool) {
+        eprintln!(
+            "ee2-hyprland: focus-change out: game={} overlay={} usingHotkey={using_hotkey}",
+            self.game_active, self.overlay_interactive
+        );
         self.broadcast(json!({
             "name": "MAIN->OVERLAY::focus-change",
             "payload": {
@@ -684,7 +691,7 @@ impl Overlay {
         self.game_origin = origin;
         if !self.game_visible {
             self.stop_area_tracker();
-            self.set_interactive(false);
+            self.set_interactive(false, "game left the screen");
         }
         self.push_surface();
     }
@@ -698,11 +705,23 @@ impl Overlay {
     /// passthrough (no input region, no keyboard) so input reaches that
     /// window. The game regaining focus also resets it
     /// (`handlePoeWindowActiveChange`).
+    ///
+    /// An *empty* class (no window focused) while the overlay is interactive
+    /// is not "another window": it is Hyprland reporting our own layer
+    /// surface giving up `Exclusive` keyboard focus (pointer moved to the
+    /// transparent background → `KeyboardMode::None`), immediately followed
+    /// by the game being refocused. Treating it as a focus loss dropped a
+    /// pinned (clicked) widget the moment the cursor left it.
     pub async fn set_game_active(&mut self, class: &str) {
+        if class.is_empty() && self.game_active && self.overlay_interactive {
+            eprintln!("ee2-hyprland: game focus: ignoring empty class (overlay released keyboard)");
+            return;
+        }
         let active = class == compositor::game_class();
         if active == self.game_active {
             return;
         }
+        eprintln!("ee2-hyprland: game focus: {active} (class {class:?})");
         self.game_active = active;
         // First: releases the evdev grab (hotkeys.rs) before anything else
         // reacts to the focus change.
@@ -712,7 +731,7 @@ impl Overlay {
         }
         if self.overlay_interactive {
             // Broadcasts focus-change itself, with the new `game`/`overlay`.
-            self.set_interactive(false);
+            self.set_interactive(false, "game focus changed");
         } else {
             self.send_focus_change(false);
         }
@@ -741,10 +760,11 @@ impl Overlay {
         self.stash_scroll_enabled
     }
 
-    pub(crate) fn set_interactive(&mut self, interactive: bool) {
+    pub(crate) fn set_interactive(&mut self, interactive: bool, reason: &str) {
         if interactive == self.overlay_interactive {
             return;
         }
+        eprintln!("ee2-hyprland: set_interactive({interactive}): {reason}");
         if interactive && !self.game_visible {
             eprintln!("ee2-hyprland: game not on screen, not activating the overlay");
             return;
@@ -771,7 +791,7 @@ impl Overlay {
     /// the overlay even mid-typing rather than just blurring the field.
     pub(crate) fn close_overlay(&mut self) {
         self.stop_area_tracker();
-        self.set_interactive(false);
+        self.set_interactive(false, "Esc");
     }
 
     /// Dispatches a hotkey firing (the index `hotkeys::watch` sent) to the
@@ -821,7 +841,7 @@ impl Overlay {
         // `areaTracker.removeListeners()` right before `toggleActiveState()`.
         self.stop_area_tracker();
         let interactive = self.overlay_interactive;
-        self.set_interactive(!interactive);
+        self.set_interactive(!interactive, "toggle-overlay");
     }
 
     /// Ports `host.mjs::runPriceCheck()`: find the game window, inject the
@@ -969,7 +989,7 @@ impl Overlay {
         // onto it — or holding the price-check modifier — actually grab
         // input.
         if focus_overlay && guard.used_recently {
-            guard.set_interactive(true);
+            guard.set_interactive(true, "focusOverlay hotkey");
         }
     }
 
@@ -992,7 +1012,7 @@ impl Overlay {
     async fn run_stash_search(overlay: &Arc<TokioMutex<Overlay>>, text: &str) {
         let (copy_item, restore_enabled, in_flight) = {
             let mut guard = overlay.lock().await;
-            guard.set_interactive(false);
+            guard.set_interactive(false, "stash-search");
             (
                 guard.copy_item.clone(),
                 guard.restore_clipboard_enabled,
@@ -1208,6 +1228,7 @@ impl Overlay {
     /// `track-area` are all log-only there too; Stage 5 is where any of
     /// them might get real handling).
     pub async fn handle_ws_event(&mut self, name: &str, payload: Value) {
+        eprintln!("ee2-hyprland: ws in: {name}");
         match name {
             "CLIENT->MAIN::save-config" => {
                 let contents = payload
@@ -1340,7 +1361,7 @@ impl Overlay {
                 // grace disabled and every receipt logged — the burst never
                 // reproduced here, so there was nothing left for the grace
                 // to guard against.
-                self.set_interactive(false);
+                self.set_interactive(false, "OVERLAY->MAIN::focus-game");
             }
             "OVERLAY->MAIN::render-state" => {
                 // `shouldShow` = `OverlayWindow.vue`'s `isOverlayVisible` —

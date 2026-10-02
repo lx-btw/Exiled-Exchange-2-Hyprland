@@ -125,9 +125,13 @@ async fn overlay_is_interactive(overlay: &Weak<TokioMutex<Overlay>>) -> bool {
     }
 }
 
-async fn set_overlay_interactive(overlay: &Weak<TokioMutex<Overlay>>, interactive: bool) {
+async fn set_overlay_interactive(
+    overlay: &Weak<TokioMutex<Overlay>>,
+    interactive: bool,
+    reason: &str,
+) {
     if let Some(o) = overlay.upgrade() {
-        o.lock().await.set_interactive(interactive);
+        o.lock().await.set_interactive(interactive, reason);
     }
 }
 
@@ -161,7 +165,7 @@ async fn handle_position(
                     "ee2-hyprland: area-tracker: click inside widget at ({x},{y}), activating"
                 );
                 *session = None;
-                set_overlay_interactive(overlay, true).await;
+                set_overlay_interactive(overlay, true, "area-tracker: click inside widget").await;
             }
         }
         Kind::Move => {
@@ -185,12 +189,15 @@ async fn handle_position(
                     broadcast_hide_exclusive_widget(overlay).await;
                 }
             } else if s.area.contains(x, y) {
-                eprintln!("ee2-hyprland: area-tracker: cursor at ({x},{y}) entered widget area, activating");
-                set_overlay_interactive(overlay, true).await;
+                if !is_interactive {
+                    eprintln!("ee2-hyprland: area-tracker: cursor at ({x},{y}) entered widget area, activating");
+                    set_overlay_interactive(overlay, true, "area-tracker: entered widget area")
+                        .await;
+                }
             } else if is_interactive {
                 eprintln!("ee2-hyprland: area-tracker: cursor at ({x},{y}) left widget area, deactivating");
                 *session = None;
-                set_overlay_interactive(overlay, false).await;
+                set_overlay_interactive(overlay, false, "area-tracker: left widget area").await;
             }
         }
     }

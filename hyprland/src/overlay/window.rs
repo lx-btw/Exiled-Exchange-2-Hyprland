@@ -141,11 +141,15 @@ pub fn set_input_region(window: &gtk4::ApplicationWindow, passthrough: bool) {
 /// the overlay stays mouse-interactive the whole time (clicking into, then
 /// out of, a text field).
 pub fn set_keyboard_mode(window: &gtk4::ApplicationWindow, exclusive: bool) {
-    window.set_keyboard_mode(if exclusive {
+    let mode = if exclusive {
         KeyboardMode::Exclusive
     } else {
         KeyboardMode::None
-    });
+    };
+    if window.keyboard_mode() != mode {
+        eprintln!("ee2-hyprland: surface: keyboard mode {mode:?}");
+    }
+    window.set_keyboard_mode(mode);
 }
 
 /// Shows or hides the layer-shell surface entirely, driven by
@@ -157,6 +161,9 @@ pub fn set_keyboard_mode(window: &gtk4::ApplicationWindow, exclusive: bool) {
 /// so any future rendering regression stays invisible instead of painting
 /// over the desktop/game.
 pub fn set_visible(window: &gtk4::ApplicationWindow, visible: bool) {
+    if window.is_visible() != visible {
+        eprintln!("ee2-hyprland: surface: visible={visible}");
+    }
     window.set_visible(visible);
 }
 
@@ -217,6 +224,7 @@ pub fn set_monitor_by_origin(window: &gtk4::ApplicationWindow, origin: Option<(i
     let display = gtk4::prelude::RootExt::display(window);
     let wanted = origin.and_then(|(x, y)| find_monitor_by_origin(&display, x, y));
     if window.monitor() != wanted {
+        eprintln!("ee2-hyprland: surface: monitor -> {origin:?}");
         window.set_monitor(wanted.as_ref());
     }
 }
