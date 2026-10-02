@@ -103,7 +103,7 @@ fn is_held(held: &HashSet<(RawFd, KeyCode)>, codes: [KeyCode; 2]) -> bool {
     held.iter().any(|(_, k)| codes.contains(k))
 }
 
-/// Live Ctrl/Shift/Alt held-state, merged across every open keyboard device
+/// Live Ctrl/Alt held-state, merged across every open keyboard device
 /// the same way `watch()`'s own `held` set is — shared with `area_tracker.rs`
 /// (ports `WidgetAreaTracker.ts`'s `e.ctrlKey`/`e.altKey` on each mouse
 /// event) so the area tracker doesn't need to open and track its own
@@ -114,7 +114,6 @@ fn is_held(held: &HashSet<(RawFd, KeyCode)>, codes: [KeyCode; 2]) -> bool {
 /// game focus either, only the `globalShortcut` registrations are).
 pub struct ModifierState {
     ctrl: AtomicBool,
-    shift: AtomicBool,
     alt: AtomicBool,
 }
 
@@ -122,21 +121,12 @@ impl ModifierState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             ctrl: AtomicBool::new(false),
-            shift: AtomicBool::new(false),
             alt: AtomicBool::new(false),
         })
     }
 
     pub fn ctrl(&self) -> bool {
         self.ctrl.load(Ordering::Relaxed)
-    }
-    /// Unused for now — `WidgetAreaTracker.ts`'s `holdKey` check only ever
-    /// compares against `Ctrl`/`Alt` (`e.ctrlKey`/`e.altKey`), never Shift.
-    /// Tracked anyway for symmetry with `hotkeys.rs`'s own held-modifier
-    /// bookkeeping, which does use all three.
-    #[allow(dead_code)]
-    pub fn shift(&self) -> bool {
-        self.shift.load(Ordering::Relaxed)
     }
     pub fn alt(&self) -> bool {
         self.alt.load(Ordering::Relaxed)
@@ -145,8 +135,6 @@ impl ModifierState {
     fn update(&self, held: &HashSet<(RawFd, KeyCode)>) {
         self.ctrl
             .store(is_held(held, Modifier::Ctrl.keycodes()), Ordering::Relaxed);
-        self.shift
-            .store(is_held(held, Modifier::Shift.keycodes()), Ordering::Relaxed);
         self.alt
             .store(is_held(held, Modifier::Alt.keycodes()), Ordering::Relaxed);
     }

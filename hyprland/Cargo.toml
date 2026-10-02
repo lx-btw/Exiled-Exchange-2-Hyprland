@@ -11,13 +11,12 @@ name = "ee2-hyprland"
 path = "src/main.rs"
 
 [dependencies]
-# async runtime + HTTP/WS host server (mirrors host.mjs's http+ws server) —
-# WS `/events` uses axum's own built-in WebSocket support (`ws` feature)
-# rather than driving tokio-tungstenite directly, so that's not a separate
-# dependency here even though axum uses it internally. `futures-util` gives
-# WebSocket's Stream/Sink impls `.split()`/`.next()`/`.send()` — axum
-# depends on it too, but that doesn't make it usable here without also
-# depending on it directly.
+# async runtime + HTTP/WS host server (mirrors upstream's main/src/server.ts).
+# WS `/events` uses axum's built-in WebSocket support (`ws` feature).
+# `futures-util` provides the Stream/Sink/Future extension traits used on it
+# (`.split()`/`.next()`/`.send()`, `now_or_never()` in game_log.rs) — axum
+# depends on it too, but that doesn't make it usable here without a direct
+# dependency.
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
@@ -34,9 +33,10 @@ gtk4 = { version = "0.11", features = ["v4_10"] }
 gtk4-layer-shell = "0.8"
 webkit6 = "0.6"
 
-# input: evdev read (hotkeys, no EVIOCGRAB) + uinput virtual keyboard (injection).
-# `tokio` feature gives `Device::into_event_stream()` (async reads, needed so
-# hotkeys.rs doesn't block the runtime the axum server and GTK share).
+# input: evdev reads + EVIOCGRAB capture while the game is focused (hotkeys,
+# input/grab.rs) and uinput virtual devices (injection, capture mirror).
+# `tokio` feature gives `Device::into_event_stream()` (async reads, so the
+# device readers don't block the runtime the axum server also runs on).
 evdev = { version = "0.13", features = ["tokio"] }
 
 # clipboard: wlr-data-control-unstable-v1, event-driven (see clipboard.rs).
@@ -45,12 +45,11 @@ evdev = { version = "0.13", features = ["tokio"] }
 # the crate compiles but exposes nothing.
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-# `event` feature only: `poll`+`eventfd`, used by clipboard.rs's writer
-# thread to multiplex "new write job" against the wayland connection's own
-# fd without a timer — already a transitive dep of wayland-client/evdev, so
-# this doesn't add a new library to the tree, just a direct-dependency
-# declaration on parts of one already there. `fs` adds inotify for
-# game_log.rs's event-driven Client.txt tail.
+# `event`: `poll`+`eventfd`, used by clipboard.rs's writer thread to
+# multiplex "new write job" against the wayland connection's own fd without
+# a timer. `fs`: inotify for game_log.rs's event-driven Client.txt tail.
+# Already a transitive dep of wayland-client/evdev, so this adds no new
+# library to the tree.
 rustix = { version = "1", features = ["event", "fs"] }
 
 # tray icon (replaces AppTray.ts)
@@ -60,15 +59,16 @@ ksni = "0.3"
 # per-file Content-Type without a separate mime_guess dependency of our own.
 rust-embed = { version = "8", features = ["mime-guess"] }
 
-# config parsing (upstream config.json is plain JSON; poe2_production_Config.ini
-# needs an ini-style parser for GameConfig.ts's showModsKey — Stage 5)
+# config parsing (upstream config.json is plain JSON; the few lines needed
+# from poe2_production_Config.ini are parsed by hand in config.rs)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # outbound HTTPS relay to trade-site APIs (proxy.rs) — rustls instead of the
 # default (native-tls/OpenSSL) backend, no system TLS lib dependency. No
-# `cookies` feature: proxy.rs manages its own per-host jar, matching
-# upstream's manual Partitioned-attribute stripping (see proxy.rs docs).
+# `cookies` feature: proxy.rs keeps its own per-host name=value jar
+# (attributes such as Cloudflare's `Partitioned`, which upstream's proxy.ts
+# strips explicitly, are dropped by construction).
 # gzip/brotli/zstd/deflate: matches upstream's own decompression model —
 # Electron's `net.request` decompresses transparently at the network-stack
 # level, so `main/src/proxy.ts` never has to think about it. reqwest does
@@ -83,7 +83,7 @@ reqwest = { version = "0.13.5", default-features = false, features = [
     "deflate",
 ] }
 
-# misc
+[dev-dependencies]
 tempfile = "3"
 
 [profile.release]
