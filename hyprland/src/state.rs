@@ -126,36 +126,38 @@ pub fn set_pointer_over_widget(over: bool) {
     }
 }
 
-fn set_passthrough_on_main_thread(passthrough: bool) {
+/// The desired state of the layer surface, applied as a whole (idempotent)
+/// on the GTK main thread — one path for every cause (interactive toggle,
+/// render-state, banner, game visibility/focus, config), so none can leave
+/// the surface shown with a stale input region or keyboard mode.
+struct Surface {
+    visible: bool,
+    interactive: bool,
+    /// Origin of the monitor showing the game; the surface is pinned to it.
+    origin: Option<(i32, i32)>,
+}
+
+fn apply_surface(surface: Surface) {
     gtk4::glib::MainContext::default().invoke(move || {
-        WINDOW.with(|w| {
-            if let Some(window) = w.borrow().as_ref() {
-                // Becoming interactive (passthrough=false) shows the window
-                // *first*, in this same GTK-thread callback, before setting
-                // `KeyboardMode::Exclusive` — found live (2026-09-24), once
-                // `main.rs` started the surface hidden by default at
-                // startup: `set_keyboard_mode`/`set_input_region` applied to
-                // a not-yet-mapped layer surface silently didn't take
-                // effect, so the overlay opened with no visible content
-                // *and* without ever actually capturing keyboard input —
-                // hotkey presses (Ctrl+D, Shift+Space) leaked straight
-                // through to the game underneath (character moved/rolled)
-                // exactly as if nothing were listening. Waiting on the
-                // renderer's own independent `render-state` event to show
-                // the window instead arrives too late for this: it's a full
-                // WS round-trip that can only complete *after* this
-                // function has already run and already (silently) failed to
-                // grab the keyboard.
-                if !passthrough {
-                    overlay::window::set_visible(window, true);
-                }
-                overlay::window::set_input_region(window, passthrough);
-            }
-        });
-        INTERACTIVE.with(|i| i.set(!passthrough));
-        if passthrough {
+        INTERACTIVE.with(|i| i.set(surface.interactive));
+        if !surface.interactive {
             POINTER_OVER_WIDGET.with(|p| p.set(false));
         }
+        WINDOW.with(|w| {
+            if let Some(window) = w.borrow().as_ref() {
+                if surface.visible {
+                    // Shown *first*, then region/keyboard mode: both are
+                    // silently ignored on a not-yet-mapped layer surface
+                    // (found live 2026-09-24 — the overlay opened without
+                    // grabbing input and hotkeys leaked to the game).
+                    overlay::window::set_monitor_by_origin(window, surface.origin);
+                    overlay::window::set_visible(window, true);
+                    overlay::window::set_input_region(window, !surface.interactive);
+                } else {
+                    overlay::window::set_visible(window, false);
+                }
+            }
+        });
         apply_keyboard_mode();
     });
 }
@@ -177,33 +179,6 @@ async fn overlay_monitor_origin() -> Option<(i32, i32)> {
         });
     });
     rx.await.ok().flatten()
-}
-
-/// Shows the surface for the welcome banner: visible, but click-through and
-/// without keyboard focus, so the game keeps receiving all input. A
-/// currently-interactive overlay is left as it is (only made visible).
-fn show_banner_on_main_thread() {
-    gtk4::glib::MainContext::default().invoke(|| {
-        WINDOW.with(|w| {
-            if let Some(window) = w.borrow().as_ref() {
-                overlay::window::set_visible(window, true);
-                if !INTERACTIVE.with(|i| i.get()) {
-                    overlay::window::set_input_region(window, true);
-                }
-            }
-        });
-        apply_keyboard_mode();
-    });
-}
-
-fn set_visible_on_main_thread(visible: bool) {
-    gtk4::glib::MainContext::default().invoke(move || {
-        WINDOW.with(|w| {
-            if let Some(window) = w.borrow().as_ref() {
-                overlay::window::set_visible(window, visible);
-            }
-        });
-    });
 }
 
 /// A parsed `ShortcutAction` (`ipc/types.ts`) this fork can actually act on.
@@ -480,6 +455,15 @@ pub struct Overlay {
     render_should_show: bool,
     /// A `render-state` has been received: the renderer's Vue app is up.
     renderer_ready: bool,
+    /// The game window is on screen: its workspace is the active one on its
+    /// monitor (`compositor::game_origin`). A layer surface is bound to a
+    /// monitor, not a workspace, so without this it follows the user to
+    /// every other workspace. The surface may only be shown while true.
+    game_visible: bool,
+    /// Origin of the monitor showing the game (the surface is pinned there).
+    game_origin: Option<(i32, i32)>,
+    /// `HostConfig.hideOverlayOnBlur` (renderer default `false`).
+    hide_overlay_on_blur: bool,
 }
 
 impl Overlay {
@@ -525,6 +509,9 @@ impl Overlay {
             banner_generation: 0,
             render_should_show: false,
             renderer_ready: false,
+            game_visible: false,
+            game_origin: None,
+            hide_overlay_on_blur: false,
         };
         Ok((
             overlay,
@@ -643,7 +630,7 @@ impl Overlay {
         self.banner_active = true;
         self.banner_generation += 1;
         let generation = self.banner_generation;
-        show_banner_on_main_thread();
+        self.push_surface();
         let weak = self.self_ref.clone();
         tokio::spawn(async move {
             tokio::time::sleep(ATTACH_BANNER_DURATION).await;
@@ -653,23 +640,83 @@ impl Overlay {
             let mut guard = overlay.lock().await;
             if guard.banner_generation == generation {
                 guard.banner_active = false;
-                if !guard.render_should_show {
-                    set_visible_on_main_thread(false);
-                }
+                guard.push_surface();
             }
         });
     }
 
+    /// Ports upstream's `syncWindowVisibility` + `showOverlay`
+    /// (`OverlayWindow.ts`) with the layer-shell differences: the surface is
+    /// only ever shown while the game window is on screen; interactive and
+    /// the welcome banner show it; otherwise it follows the renderer's
+    /// `shouldShow`, and with `hideOverlayOnBlur` additionally only while
+    /// the game is the focused window.
+    fn surface_should_show(&self) -> bool {
+        if !self.game_visible {
+            return false;
+        }
+        if self.overlay_interactive || self.banner_active {
+            return true;
+        }
+        self.render_should_show && (!self.hide_overlay_on_blur || self.game_active)
+    }
+
+    fn push_surface(&self) {
+        apply_surface(Surface {
+            visible: self.surface_should_show(),
+            interactive: self.overlay_interactive,
+            origin: self.game_origin,
+        });
+    }
+
+    /// Called whenever `compositor::game_origin()` is re-queried (workspace
+    /// switch, game moved between workspaces/monitors, opened/closed, ...).
+    /// Game not on screen → drop the surface entirely, non-interactive and
+    /// click-through, with hover tracking reset (upstream's
+    /// `removeListeners`). Game on screen again → shown per the current
+    /// `render-state`, not interactive.
+    pub fn set_game_placement(&mut self, origin: Option<(i32, i32)>) {
+        if origin.is_some() == self.game_visible && origin == self.game_origin {
+            return;
+        }
+        eprintln!("ee2-hyprland: game on screen: {origin:?}");
+        self.game_visible = origin.is_some();
+        self.game_origin = origin;
+        if !self.game_visible {
+            self.stop_area_tracker();
+            self.set_interactive(false);
+        }
+        self.push_surface();
+    }
+
     /// Called by the compositor focus-watcher whenever the focused window's
     /// class changes.
+    ///
+    /// The layer surface isn't a window: the game *stays* the active window
+    /// while the user works with an interactive overlay. So the game losing
+    /// focus means the user went to another window — the overlay drops to
+    /// passthrough (no input region, no keyboard) so input reaches that
+    /// window. The game regaining focus also resets it
+    /// (`handlePoeWindowActiveChange`).
     pub async fn set_game_active(&mut self, class: &str) {
         let active = class == compositor::game_class();
         if active == self.game_active {
             return;
         }
         self.game_active = active;
+        // First: releases the evdev grab (hotkeys.rs) before anything else
+        // reacts to the focus change.
         let _ = self.hotkeys_active.send(active);
-        self.send_focus_change(false);
+        if !active {
+            self.stop_area_tracker();
+        }
+        if self.overlay_interactive {
+            // Broadcasts focus-change itself, with the new `game`/`overlay`.
+            self.set_interactive(false);
+        } else {
+            self.send_focus_change(false);
+        }
+        self.push_surface();
         if active && !self.game_attached {
             self.announce_attached().await;
         }
@@ -698,8 +745,12 @@ impl Overlay {
         if interactive == self.overlay_interactive {
             return;
         }
+        if interactive && !self.game_visible {
+            eprintln!("ee2-hyprland: game not on screen, not activating the overlay");
+            return;
+        }
         self.overlay_interactive = interactive;
-        set_passthrough_on_main_thread(!interactive);
+        self.push_surface();
         let _ = self.overlay_interactive_tx.send(interactive);
         // A layer surface isn't a window and never appears in `activewindow`
         // events, so this is the *only* way the renderer learns the overlay
@@ -1209,6 +1260,12 @@ impl Overlay {
                     .get("restoreClipboard")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+
+                self.hide_overlay_on_blur = payload
+                    .get("hideOverlayOnBlur")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.push_surface();
             }
             "CLIENT->MAIN::user-action" => {
                 match payload.get("action").and_then(Value::as_str) {
@@ -1299,13 +1356,10 @@ impl Overlay {
                     .unwrap_or(true);
                 eprintln!("ee2-hyprland: render-state shouldShow={should_show}");
                 self.render_should_show = should_show;
-                // The welcome banner's own hold on the surface isn't part of
-                // `shouldShow`; don't let an unrelated "false" cut it short
-                // (the banner's timer re-checks `render_should_show`).
-                if should_show || !self.banner_active || self.overlay_interactive {
-                    set_visible_on_main_thread(should_show);
-                }
+                // The banner's own hold on the surface isn't part of
+                // `shouldShow` (`surface_should_show` keeps it up).
                 self.renderer_ready = true;
+                self.push_surface();
                 if std::mem::take(&mut self.attach_pending) {
                     self.deliver_attached().await;
                 }

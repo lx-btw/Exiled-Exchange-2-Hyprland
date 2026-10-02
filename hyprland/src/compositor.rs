@@ -78,6 +78,36 @@ pub struct Client {
     pub xwayland: bool,
     pub at: (i32, i32),
     pub size: (i32, i32),
+    /// Visibility inputs (`game_origin`). Defaulted so a reply missing them
+    /// (e.g. `activewindow`) still parses.
+    #[serde(default)]
+    pub workspace: WorkspaceRef,
+    #[serde(default)]
+    pub monitor: i32,
+    #[serde(default)]
+    pub mapped: bool,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// `{"id": .., "name": ..}` — only the id matters. Special workspaces have
+/// negative ids.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct WorkspaceRef {
+    pub id: i64,
+}
+
+/// One entry of `j/monitors` — the fields needed to tell which workspace a
+/// monitor currently shows, and where it sits in the global layout.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Monitor {
+    pub id: i32,
+    pub x: i32,
+    pub y: i32,
+    #[serde(rename = "activeWorkspace")]
+    pub active_workspace: WorkspaceRef,
+    #[serde(rename = "specialWorkspace")]
+    pub special_workspace: WorkspaceRef,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +161,47 @@ async fn command_inner(command: &str) -> io::Result<String> {
     let mut response = String::new();
     stream.read_to_string(&mut response).await?;
     Ok(response)
+}
+
+pub async fn monitors() -> io::Result<Vec<Monitor>> {
+    let raw = command("j/monitors").await?;
+    serde_json::from_str(&raw).map_err(io::Error::other)
+}
+
+/// Where the game window is *on screen right now*: the origin of the monitor
+/// that currently displays it, or `None` if it isn't displayed (no game
+/// window, unmapped/hidden, its workspace isn't the active one on its
+/// monitor, or a special workspace is covering it). A layer surface belongs
+/// to a monitor, not a workspace, so this is what the overlay's visibility
+/// has to follow (ports `electron-overlay-window`'s "overlay is bound to the
+/// game window").
+pub async fn game_origin() -> io::Result<Option<(i32, i32)>> {
+    let (clients, monitors) = tokio::join!(clients(), monitors());
+    Ok(visible_game_origin(&clients?, &monitors?))
+}
+
+fn visible_game_origin(clients: &[Client], monitors: &[Monitor]) -> Option<(i32, i32)> {
+    let class = game_class();
+    clients
+        .iter()
+        .filter(|c| c.class == class && c.mapped && !c.hidden)
+        .find_map(|game| {
+            let ws = game.workspace.id;
+            let monitor = if ws < 0 {
+                // On a special workspace: shown iff some monitor has exactly
+                // that special workspace open.
+                monitors.iter().find(|m| m.special_workspace.id == ws)
+            } else {
+                // A regular workspace is covered while a special one is open
+                // on the same monitor.
+                monitors.iter().find(|m| {
+                    m.id == game.monitor
+                        && m.active_workspace.id == ws
+                        && m.special_workspace.id == 0
+                })
+            };
+            monitor.map(|m| (m.x, m.y))
+        })
 }
 
 pub async fn clients() -> io::Result<Vec<Client>> {
@@ -210,6 +281,11 @@ pub enum WatchEvent {
     /// carries its class. Lets `state.rs` tell a fresh game window from
     /// mere re-focus of an existing one (welcome banner, once per window).
     WindowOpened(String),
+    /// Something that can change which workspace/monitor shows the game
+    /// window happened (workspace switch, monitor focus, special workspace,
+    /// window moved/opened/closed, monitor added/removed) — the receiver
+    /// re-queries `game_origin()`. Event-driven only, no polling.
+    LayoutChanged,
 }
 
 /// Subscribes to `.socket2.sock` and sends [`WatchEvent`]s on `tx` every
@@ -225,6 +301,12 @@ pub async fn watch_active_window(tx: mpsc::UnboundedSender<WatchEvent>) -> io::R
         )
     })?;
 
+    let mut stream = UnixStream::connect(dir.join(".socket2.sock")).await?;
+
+    // Connected before the initial queries so no event is missed in between.
+    // Layout first: the focus handler may start the welcome banner, which
+    // needs to know the game is on screen.
+    let _ = tx.send(WatchEvent::LayoutChanged);
     match active_window().await {
         Ok(Some(client)) => {
             let _ = tx.send(WatchEvent::ActiveWindow(client.class, client.title));
@@ -233,7 +315,6 @@ pub async fn watch_active_window(tx: mpsc::UnboundedSender<WatchEvent>) -> io::R
         Err(err) => eprintln!("ee2-hyprland: initial active_window() query failed: {err}"),
     }
 
-    let mut stream = UnixStream::connect(dir.join(".socket2.sock")).await?;
     // Bytes, not a String: decoding each raw read() chunk independently
     // would split a multi-byte UTF-8 character that happens to straddle a
     // 4096-byte read boundary, corrupting non-ASCII window classes/titles
@@ -274,7 +355,24 @@ pub async fn watch_active_window(tx: mpsc::UnboundedSender<WatchEvent>) -> io::R
                 {
                     return Ok(());
                 }
+            } else if matches!(
+                event,
+                "workspacev2"
+                    | "focusedmonv2"
+                    | "activespecialv2"
+                    | "movewindowv2"
+                    | "moveworkspacev2"
+                    | "closewindow"
+                    | "monitoraddedv2"
+                    | "monitorremovedv2"
+            ) {
+                if tx.send(WatchEvent::LayoutChanged).is_err() {
+                    return Ok(());
+                }
             } else if event == "openwindow" {
+                if tx.send(WatchEvent::LayoutChanged).is_err() {
+                    return Ok(());
+                }
                 // ADDRESS,WORKSPACE,CLASS,TITLE — class is the third field;
                 // commas in the title only add fields after it.
                 let Some(class) = data.split(',').nth(2) else {
@@ -288,5 +386,74 @@ pub async fn watch_active_window(tx: mpsc::UnboundedSender<WatchEvent>) -> io::R
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(ws: i64, monitor: i32) -> Client {
+        Client {
+            class: game_class(),
+            title: String::new(),
+            xwayland: false,
+            at: (0, 0),
+            size: (0, 0),
+            workspace: WorkspaceRef { id: ws },
+            monitor,
+            mapped: true,
+            hidden: false,
+        }
+    }
+
+    fn monitor(id: i32, x: i32, active: i64, special: i64) -> Monitor {
+        Monitor {
+            id,
+            x,
+            y: 0,
+            active_workspace: WorkspaceRef { id: active },
+            special_workspace: WorkspaceRef { id: special },
+        }
+    }
+
+    #[test]
+    fn visible_only_on_the_active_workspace_of_its_monitor() {
+        let monitors = [monitor(0, 0, 1, 0), monitor(1, 2560, 5, 0)];
+        assert_eq!(
+            visible_game_origin(&[client(1, 0)], &monitors),
+            Some((0, 0))
+        );
+        assert_eq!(visible_game_origin(&[client(2, 0)], &monitors), None);
+        assert_eq!(
+            visible_game_origin(&[client(5, 1)], &monitors),
+            Some((2560, 0))
+        );
+        // Workspace 1 active on monitor 0 doesn't make a game on monitor 1 visible.
+        assert_eq!(visible_game_origin(&[client(1, 1)], &monitors), None);
+        assert_eq!(visible_game_origin(&[], &monitors), None);
+    }
+
+    #[test]
+    fn special_workspace_covers_a_regular_one() {
+        let covered = [monitor(0, 0, 1, -99)];
+        assert_eq!(visible_game_origin(&[client(1, 0)], &covered), None);
+        // ...and a game on that special workspace is the visible one.
+        assert_eq!(
+            visible_game_origin(&[client(-99, 0)], &covered),
+            Some((0, 0))
+        );
+        assert_eq!(visible_game_origin(&[client(-98, 0)], &covered), None);
+    }
+
+    #[test]
+    fn unmapped_or_hidden_game_is_not_visible() {
+        let monitors = [monitor(0, 0, 1, 0)];
+        let mut c = client(1, 0);
+        c.mapped = false;
+        assert_eq!(visible_game_origin(&[c], &monitors), None);
+        let mut c = client(1, 0);
+        c.hidden = true;
+        assert_eq!(visible_game_origin(&[c], &monitors), None);
     }
 }

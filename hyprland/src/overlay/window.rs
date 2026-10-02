@@ -209,10 +209,19 @@ pub fn current_monitor_origin(window: &gtk4::ApplicationWindow) -> Option<(i32, 
     Some((geometry.x(), geometry.y()))
 }
 
-/// Finds the monitor whose **origin** matches `(x, y)`. Used once
-/// `compositor.rs` (Stage 2) can report which monitor the game window is
-/// actually on — unreferenced until then.
-#[allow(dead_code)]
+/// Pins the surface to the monitor whose origin is `origin` (the one
+/// showing the game window), or lets the compositor choose if `None`/no
+/// match. gtk4-layer-shell remaps a mapped surface itself when this changes,
+/// so it is only called on an actual change.
+pub fn set_monitor_by_origin(window: &gtk4::ApplicationWindow, origin: Option<(i32, i32)>) {
+    let display = gtk4::prelude::RootExt::display(window);
+    let wanted = origin.and_then(|(x, y)| find_monitor_by_origin(&display, x, y));
+    if window.monitor() != wanted {
+        window.set_monitor(wanted.as_ref());
+    }
+}
+
+/// Finds the monitor whose **origin** matches `(x, y)`.
 pub fn find_monitor_by_origin(display: &gdk::Display, x: i32, y: i32) -> Option<gdk::Monitor> {
     display
         .monitors()

@@ -174,13 +174,22 @@ fn main() -> gtk4::glib::ExitCode {
                 let overlay = overlay.clone();
                 tokio::spawn(async move {
                     while let Some(event) = focus_rx.recv().await {
-                        let mut guard = overlay.lock().await;
                         match event {
                             compositor::WatchEvent::ActiveWindow(class, _title) => {
-                                guard.set_game_active(&class).await
+                                overlay.lock().await.set_game_active(&class).await
                             }
                             compositor::WatchEvent::WindowOpened(class) => {
-                                guard.on_window_opened(&class)
+                                overlay.lock().await.on_window_opened(&class)
+                            }
+                            compositor::WatchEvent::LayoutChanged => {
+                                // Queried outside the Overlay lock; on error the
+                                // previous placement is kept.
+                                match compositor::game_origin().await {
+                                    Ok(origin) => overlay.lock().await.set_game_placement(origin),
+                                    Err(err) => eprintln!(
+                                        "ee2-hyprland: game placement query failed: {err}"
+                                    ),
+                                }
                             }
                         }
                     }
