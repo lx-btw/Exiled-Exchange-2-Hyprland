@@ -3,9 +3,8 @@
 # Builds directly from this private repo's own working tree — no source
 # array, no VCS fetch, no tarball. This file only makes sense run from
 # inside the checkout it lives in (hyprland/packaging/PKGBUILD); it is not
-# meant to be relocated or published standalone. Stage 6a, PLAN.md: local
-# packaging only — CI, a README for outside users, and any kind of
-# publication are explicitly a later, separate stage.
+# meant to be relocated or published standalone. Local packaging only — CI,
+# a README for outside users and publication are PLAN.md's Stage 6b.
 pkgname=ee2-hyprland
 pkgver=0.1.0
 pkgrel=1
@@ -52,8 +51,8 @@ depends=(
   'webkitgtk-6.0'
 )
 # wl-clipboard is deliberately NOT here. clipboard.rs's native-Wayland path
-# owns its own zwlr_data_control_source_v1 for writes (Phase C, PLAN.md)
-# and reads wlr-data-control events directly — no wl-copy/wl-paste
+# owns its own zwlr_data_control_source_v1 for writes and reads
+# wlr-data-control events directly — no wl-copy/wl-paste
 # subprocess anywhere in production code, only in that module's own
 # #[cfg(test)] tests (which verify against a real wl-paste independently
 # of what write_text itself does). Re-verify with:
@@ -87,7 +86,7 @@ _repo_root="$startdir/../.."
 prepare() {
   cd "$_repo_root/renderer"
   npm ci
-  # CLAUDE.md: "must run before dev/build — generates data-driven assets".
+  # CLAUDE.md: "must run before build — generates data-driven assets".
   npm run make-index-files
 }
 

@@ -1,8 +1,8 @@
-# Packaging (Stage 6a — local only)
+# Packaging (local only)
 
 Local install only: build and run without a terminal, lifecycle tied to the
-game. No CI, no README for outside users, no publication — see PLAN.md
-Stage 6.
+game. CI, a README for outside users and publication are still open — see
+PLAN.md, "Remaining work: Stage 6b".
 
 ## Build
 
@@ -41,9 +41,10 @@ to whatever user runs `ee2-hyprland`:
 **Why no rule is shipped**: a package silently dropping a udev rule at
 install time is exactly the kind of unrequested, system-wide side effect
 this fork's own design principle for Hyprland's config argues against
-(CLAUDE.md's fork-boundary section — "no Hyprland config is ever touched…
-whose config-bind approach broke the same key combos in other applications
-system-wide"). The same reasoning extends to udev here: granting a process
+(CLAUDE.md's fork-boundary section: the app never edits or binds anything
+in Hyprland's config, because a prototype's config binds broke the same key
+combos in other applications system-wide). The same reasoning extends to
+udev here: granting a process
 `/dev/uinput` write access is a real, host-wide capability change (any
 process with it can inject arbitrary input system-wide, not just into this
 game), so it should be something the person installing this explicitly

@@ -9,14 +9,13 @@ ExecStart=/usr/bin/ee2-hyprland
 Restart=on-failure
 RestartSec=2
 
-# The binary's own outbound relay (proxy.rs) talks to trade-site APIs over
-# loopback-facing WebView requests too (server.rs binds 127.0.0.1:0 for the
-# HTTP+WS surface the renderer loads from). If this user session ever has
-# http_proxy/https_proxy set (some setups export it globally), reqwest and
-# the WebView's own network stack would otherwise try to route loopback
-# traffic through it — pointless at best, broken at worst. Both spellings
-# because different consumers (reqwest via `env` inspection, other libc-based
-# tools) check different cases.
+# The WebView loads the renderer from our own loopback server (server.rs
+# binds 127.0.0.1:0). If this user session ever has http_proxy/https_proxy set
+# (some setups export it globally), WebKit's network stack routes those
+# loopback requests through the proxy too and they fail — the renderer never
+# mounts (HYPRLAND-NOTES.md §10). Outbound trade-site requests (proxy.rs,
+# reqwest) still use the proxy. Both spellings because different consumers
+# check different cases.
 Environment=NO_PROXY=127.0.0.1,localhost
 Environment=no_proxy=127.0.0.1,localhost
 
@@ -32,6 +31,6 @@ Environment=no_proxy=127.0.0.1,localhost
 # ever getting wired into session autostart by a routine `enable`, since an
 # overlay sitting in every session regardless of whether PoE2 is even
 # running is exactly the always-on-in-the-background footprint this fork's
-# lifecycle design (PLAN.md, Stage 6a) exists to avoid. If autostart is ever
+# lifecycle design exists to avoid. If autostart is ever
 # wanted, add [Install] WantedBy=graphical-session.target explicitly rather
 # than assuming this omission was an oversight.

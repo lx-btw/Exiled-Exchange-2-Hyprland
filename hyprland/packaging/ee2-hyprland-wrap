@@ -16,18 +16,13 @@
 # necessarily the game's monitor.
 #
 # This fork's overlay doesn't have that problem: the layer-shell surface is
-# fully unmapped (`window.set_visible(false)`, hyprland/src/overlay/window.rs)
-# whenever nothing needs to be shown, and unmapping/remapping a GTK toplevel
-# destroys and recreates its underlying Wayland surface — so every time the
-# overlay becomes visible again, Hyprland is choosing its monitor fresh, not
-# reusing a placement decision from whenever the surface first appeared. And
-# the overlay only ever becomes visible in response to a hotkey or hover
-# action, both gated on the game actually being the focused window
-# (`hotkeys.rs`'s `game_active` gate) — so by the time any surface is ever
-# mapped, the game already has focus and Hyprland's layer-shell placement
-# naturally lands on the game's own monitor. No polling needed either way:
-# starting the service here just makes sure it's up by the time the game
-# might want it, same as the prototype's separate host service did.
+# only mapped while the game window is on screen, and is pinned to the
+# monitor showing it (hyprland/src/state.rs + compositor::game_origin,
+# overlay::window::set_monitor_by_origin), re-evaluated on every
+# workspace/monitor/window event from Hyprland's event socket. So the
+# service can start before the game window exists — no polling needed:
+# starting it here just makes sure it's up by the time the game might want
+# it, same as the prototype's separate host service did.
 set -uo pipefail
 
 cleanup() {
