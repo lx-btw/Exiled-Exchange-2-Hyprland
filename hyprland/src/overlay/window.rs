@@ -48,8 +48,7 @@ use webkit6::WebView;
 /// (`background-color: #1e1e2e`). That's a real, correctly-rendered opaque
 /// pixel in this window's own buffer, so GDK's Wayland backend correctly
 /// reports it to the compositor via `wl_surface.set_opaque_region` covering
-/// the whole surface — confirmed with `WAYLAND_DEBUG=1`
-/// (`hyprland/examples/transparency_lab.rs`): without this fix, a
+/// the whole surface — confirmed with `WAYLAND_DEBUG=1`: without this fix, a
 /// `wl_region.add(0, 0, <monitor W>, <monitor H>)` +
 /// `wl_surface.set_opaque_region(...)` is sent right before every commit;
 /// with it, `set_opaque_region` is never sent at all (GDK computes there's

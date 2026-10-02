@@ -149,9 +149,7 @@ fn open_external(uri: &str) {
 /// **Render-storm fix, now via per-`WebView` API instead of a process-wide
 /// env var** (PLAN.md, "Storm mechanism" / Session 7 / G1): originally
 /// `WEBKIT_DISABLE_COMPOSITING_MODE=1` set as a process env var in
-/// `main.rs`, before any WebKit object existed. Verified in G1
-/// (`hyprland/diag/G1_*`, both the lab's `EE2_LAB_HWACCEL=never` mode and
-/// the real binary's tray-toggle cycle) that
+/// `main.rs`, before any WebKit object existed. Verified that
 /// `settings.set_hardware_acceleration_policy(Never)` reproduces the exact
 /// same fix — WebKit falls through its non-accelerated rendering path,
 /// which re-attaches a real buffer through the window's own surface on
