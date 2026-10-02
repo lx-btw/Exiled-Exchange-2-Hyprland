@@ -1,8 +1,8 @@
-# Packaging (local only)
+# Packaging
 
-Local install only: build and run without a terminal, lifecycle tied to the
-game. CI, a README for outside users and publication are still open — see
-PLAN.md, "Remaining work: Stage 6b".
+Build and run without a terminal, lifecycle tied to the game. CI builds the same
+package (`.github/workflows/hyprland-ci.yml`) and attaches it to a GitHub Release
+for `v<pkgver>` tags; the user-facing overview is `.github/README.md`.
 
 ## Build
 

@@ -1,10 +1,10 @@
 # Maintainer: aleksey <zheahasyun@gazeta.pl>
 #
-# Builds directly from this private repo's own working tree — no source
-# array, no VCS fetch, no tarball. This file only makes sense run from
-# inside the checkout it lives in (hyprland/packaging/PKGBUILD); it is not
-# meant to be relocated or published standalone. Local packaging only — CI,
-# a README for outside users and publication are PLAN.md's Stage 6b.
+# Builds directly from this repo's own working tree — no source array, no
+# VCS fetch, no tarball. This file only makes sense run from inside the
+# checkout it lives in (hyprland/packaging/PKGBUILD); it is not meant to be
+# relocated or published standalone. CI (.github/workflows/hyprland-ci.yml)
+# runs it the same way to produce the release package.
 pkgname=ee2-hyprland
 pkgver=0.1.0
 pkgrel=1

@@ -20,11 +20,17 @@ limitations and the maintenance procedures (pulling upstream, bug triage) are in
   them.** Not a one-line fix, not a config tweak. They must stay byte-for-byte
   mergeable with `upstream/master` at all times.
 - `hyprland/` is the only directory with fork code (plus the root `CLAUDE.md`,
-  `PLAN.md`). It talks to the unmodified `renderer/` over the same HTTP+WebSocket
-  protocol upstream's Electron host uses; `ipc/types.ts` is the contract.
+  `PLAN.md`, `.github/README.md` and `.github/workflows/hyprland-*.yml` — new files
+  only; upstream's `.github/workflows/{main,pages,test}.yml` stay untouched and are
+  disabled in the repo settings; the root `README.md` is upstream's). It talks to the
+  unmodified `renderer/` over the same HTTP+WebSocket protocol upstream's Electron
+  host uses; `ipc/types.ts` is the contract.
 - Branches: `master` mirrors `upstream/master` exactly (fast-forward only, never
-  commit there). `hyprland` carries all fork code and merges `master` as upstream
-  moves. Remote `upstream` has push disabled on purpose (`git remote set-url --push
+  commit there). `hyprland` carries all fork code, merges `master` as upstream moves,
+  and is the default branch on `origin` (scheduled workflows run from the default
+  branch). Sync PRs from the bot branch `upstream-sync` are merged with a **merge
+  commit only** — squash/rebase breaks "`master` is an ancestor of `hyprland`".
+  Remote `upstream` has push disabled on purpose (`git remote set-url --push
   upstream DISABLE`) — fetch-only; a push failure there means something is
   misconfigured, not an obstacle to route around.
 - **Input rule: the app never edits or binds anything in Hyprland's config** — no
@@ -108,6 +114,17 @@ makepkg -f
 
 Don't run `sudo`/`pacman` yourself; installing is the user's step. `main/` is never
 built here — it's kept only as a porting reference (`main/src/*.ts`).
+
+## CI
+
+- `.github/workflows/hyprland-ci.yml` (Arch container): fork-boundary allowlist
+  check, `fmt`, `clippy`, `cargo test` minus the two live-Wayland clipboard write
+  tests, `makepkg` artifact; a tag `v<pkgver>` additionally publishes a GitHub
+  Release with the package.
+- `.github/workflows/hyprland-upstream-sync.yml` (daily): fast-forwards `master`
+  from `upstream/master` (pushes via the deploy-key secret `SYNC_DEPLOY_KEY`),
+  merges it into `upstream-sync` and opens/updates the PR into `hyprland`.
+- Setup, release procedure and caveats: PLAN.md, "CI and upstream sync".
 
 ## Runtime and debugging
 

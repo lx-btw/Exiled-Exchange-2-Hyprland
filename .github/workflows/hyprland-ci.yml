@@ -1,0 +1,156 @@
+# Fork CI (hyprland branch only). Builds and checks the Rust host in an Arch
+# container — the distro the package targets — and uploads the pacman package.
+# A `v<pkgver>` tag additionally publishes it as a GitHub Release.
+name: hyprland-ci
+
+on:
+  push:
+    branches: [hyprland, upstream-sync]
+    tags: ['v*']
+    paths-ignore: ['**/*.md']   # not evaluated for tag pushes
+  pull_request:
+    branches: [hyprland]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hyprland-ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: bash   # explicit shell => bash -eo pipefail
+
+jobs:
+  build:
+    name: Check, test, package (Arch)
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:base-devel
+      # If the tray test fails on glycin/bwrap inside the container:
+      # options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: /cargo-home       # shared by the root steps and the makepkg user
+      npm_config_cache: /npm-cache
+      CARGO_TERM_COLOR: always
+    steps:
+      # git must exist before checkout, otherwise checkout falls back to a REST
+      # tarball without .git and the boundary check below has no history.
+      - name: Install build dependencies
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Su --noconfirm --needed git nodejs npm rust gtk4 gtk4-layer-shell webkitgtk-6.0
+          rustc --version
+          cargo clippy --version
+          node --version
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0       # full history: the boundary check needs the merge base
+          filter: blob:none    # commits and trees only; blobs are fetched lazily
+
+      # Fork files only: everything else must stay byte-for-byte upstream.
+      # `origin/master...HEAD` diffs from the merge base, so upstream commits not
+      # merged into hyprland yet don't count as violations.
+      - name: Fork boundary
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          bad=$(git diff --name-only origin/master...HEAD \
+                | grep -vE '^(hyprland/|\.github/workflows/hyprland-[^/]+\.ya?ml$|\.github/README\.md$|CLAUDE\.md$|PLAN\.md$)' || true)
+          if [ -n "$bad" ]; then
+            echo "::error title=Fork boundary violated::files outside the fork area differ from master"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: only fork files differ from $(git merge-base origin/master HEAD)"
+
+      - name: Tag matches PKGBUILD pkgver
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          have=$(sed -n 's/^pkgver=//p' hyprland/packaging/PKGBUILD)
+          want=${GITHUB_REF_NAME#v}
+          if [ "$have" != "$want" ]; then
+            echo "::error::tag $GITHUB_REF_NAME but PKGBUILD pkgver=$have"
+            exit 1
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: hyprland -> target
+          # Caches saved from the default branch are readable by every other ref.
+          save-if: ${{ github.ref == 'refs/heads/hyprland' }}
+
+      - uses: actions/cache@v6
+        with:
+          path: /npm-cache
+          key: npm-${{ hashFiles('renderer/package-lock.json') }}
+          restore-keys: npm-
+
+      - name: cargo fmt
+        working-directory: hyprland
+        run: cargo fmt --check
+
+      # rust-embed needs the folder at compile time; debug builds read it from
+      # disk at runtime, so an empty one is enough for clippy and tests.
+      # makepkg below builds the real renderer for the release binary.
+      - name: Placeholder renderer/dist
+        run: mkdir -p renderer/dist
+
+      - name: cargo clippy
+        working-directory: hyprland
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The two clipboard tests need a live compositor with wlr-data-control;
+      # without one they hang rather than fail.
+      - name: cargo test
+        working-directory: hyprland
+        timeout-minutes: 15
+        run: >
+          cargo test --locked --
+          --skip clipboard::tests::write_text_round_trips_without_a_wl_copy_subprocess
+          --skip clipboard::tests::write_text_restoring_restores_after_the_wait
+
+      - name: makepkg
+        run: |
+          rm -rf renderer/dist   # let the PKGBUILD produce the real one
+          useradd -m builder
+          mkdir -p /npm-cache "$CARGO_HOME"
+          chown -R builder: "$GITHUB_WORKSPACE" /npm-cache "$CARGO_HOME"
+          cd hyprland/packaging
+          # makepkg refuses to run as root; runuser keeps CARGO_HOME/npm_config_cache.
+          runuser -u builder -- env HOME=/home/builder makepkg -f --noconfirm
+          sha256sum ./*.pkg.tar.zst | tee SHA256SUMS
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ee2-hyprland-pkg
+          path: |
+            hyprland/packaging/*.pkg.tar.zst
+            hyprland/packaging/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0   # already zstd
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ee2-hyprland-pkg
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME"
+          --generate-notes --verify-tag

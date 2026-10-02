@@ -1,0 +1,192 @@
+# Daily upstream sync (runs from the default branch, `hyprland`).
+#  1. Fast-forwards `master` to upstream/master (never anything else).
+#  2. Merges it into the bot branch `upstream-sync` on top of `hyprland` and
+#     opens/updates a PR into `hyprland` with the ipc/ diff to review.
+# All pushes go through the write deploy key SYNC_DEPLOY_KEY: GITHUB_TOKEN can't
+# push commits that touch .github/workflows/ (upstream edits its workflows), and
+# its pushes wouldn't trigger hyprland-ci on `upstream-sync`.
+# No npm/cargo here: upstream code never runs next to the write key.
+name: hyprland-upstream-sync
+
+on:
+  schedule:
+    - cron: '23 4 * * *'   # daily 04:23 UTC
+  workflow_dispatch:
+    inputs:
+      allow_unregistered_workflows:
+        description: Push master even if it carries upstream workflow files GitHub hasn't registered yet (they'd start, then get cancelled)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read          # pushes use the deploy key
+  pull-requests: write    # open/update the sync PR
+  actions: write          # disable/cancel upstream workflows
+
+concurrency:
+  group: hyprland-upstream-sync
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      UPSTREAM_URL: https://github.com/Kvan7/Exiled-Exchange-2.git
+      SYNC_BRANCH: upstream-sync
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: hyprland
+          fetch-depth: 0
+          ssh-key: ${{ secrets.SYNC_DEPLOY_KEY }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch --no-tags upstream master
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Is master a fast-forward?
+        id: ff
+        run: |
+          old=$(git rev-parse origin/master)
+          new=$(git rev-parse upstream/master)
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          if [ "$old" = "$new" ]; then
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            echo "master already at upstream ${new:0:8}"
+          elif git merge-base --is-ancestor "$old" "$new"; then
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+            git log --oneline "$old..$new" | head -50
+          else
+            echo "::error title=master diverged::origin/master ${old:0:8} is not an ancestor of upstream/master ${new:0:8} (upstream rewrote history, or something was committed to master). Nothing pushed; fix by hand."
+            exit 1
+          fi
+
+      # Upstream's Build (Electron for Windows/macOS/Linux) and Docs are useless
+      # here and Build is expensive on a private repo; they must be disabled
+      # before master moves, and GitHub can only disable a registered workflow.
+      - name: Upstream workflows must not run on master
+        if: steps.ff.outputs.moved == 'true'
+        env:
+          NEW: ${{ steps.ff.outputs.new }}
+          ALLOW: ${{ inputs.allow_unregistered_workflows || false }}
+        run: |
+          reg=$(gh api "repos/$GH_REPO/actions/workflows" --paginate \
+                --jq '.workflows[] | "\(.path)\t\(.state)\t\(.id)"')
+          while IFS=$'\t' read -r path state id; do
+            [ -z "$path" ] && continue
+            case "$path" in .github/workflows/hyprland-*) continue ;; esac
+            if [ "$state" = active ]; then
+              echo "::warning::disabling upstream workflow $path"
+              gh workflow disable "$id"
+            fi
+          done <<< "$reg"
+          missing=""
+          for f in $(git ls-tree --name-only "$NEW" .github/workflows/); do
+            grep -qF "$f"$'\t' <<< "$reg" || missing="$missing $f"
+          done
+          if [ -n "$missing" ] && [ "$ALLOW" != true ]; then
+            echo "::error title=Unregistered upstream workflows::$missing would start on the master push. Register and disable them (PLAN.md, CI and upstream sync), or dispatch this workflow with allow_unregistered_workflows=true."
+            exit 1
+          fi
+
+      - name: Fast-forward master
+        if: steps.ff.outputs.moved == 'true'
+        run: |
+          # no --force: the server rejects anything that isn't a fast-forward
+          git push origin "${{ steps.ff.outputs.new }}:refs/heads/master"
+
+      - name: Cancel anything the master push started
+        if: steps.ff.outputs.moved == 'true'
+        env:
+          NEW: ${{ steps.ff.outputs.new }}
+        run: |
+          sleep 20
+          gh run list --branch master --commit "$NEW" --json databaseId,workflowName,status \
+            --jq '.[] | select(.status != "completed") | "\(.databaseId)\t\(.workflowName)"' |
+          while IFS=$'\t' read -r id name; do
+            echo "::warning::cancelling upstream run $name ($id)"
+            gh run cancel "$id" || true
+          done
+          gh api "repos/$GH_REPO/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active") | select(.path | startswith(".github/workflows/hyprland-") | not) | .id' |
+          xargs -r -n1 gh workflow disable
+
+      - name: Merge upstream into upstream-sync
+        id: merge
+        run: |
+          new=$(git rev-parse upstream/master)
+          if git merge-base --is-ancestor "$new" origin/hyprland; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "hyprland already contains upstream ${new:0:8}"
+            exit 0
+          fi
+          echo "needed=true" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "origin/$SYNC_BRANCH" > /dev/null &&
+             git merge-base --is-ancestor origin/hyprland "origin/$SYNC_BRANCH" &&
+             git merge-base --is-ancestor "$new" "origin/$SYNC_BRANCH"; then
+            echo "origin/$SYNC_BRANCH is already up to date; not re-pushing"
+            exit 0
+          fi
+          git switch -C "$SYNC_BRANCH" origin/hyprland
+          if ! git merge --no-ff --no-edit -m "Merge upstream master ${new:0:8} into hyprland" upstream/master; then
+            files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            git merge --abort
+            echo "::error title=Upstream merge conflict::upstream ${new:0:8} conflicts with hyprland in: $files- resolve locally (PLAN.md, Maintenance procedures (a))."
+            printf '### Merge conflict\n\nConflicting files: `%s`\n' "$files" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          # bot-owned branch, rebuilt from hyprland every time
+          git push --force origin "$SYNC_BRANCH"
+
+      - name: Open or update the sync PR
+        if: steps.merge.outputs.needed == 'true'
+        run: |
+          new=$(git rev-parse upstream/master)
+          base=$(git merge-base origin/hyprland upstream/master)
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Automated merge of upstream \`master\` ${new:0:8} into \`hyprland\` (previous merge base ${base:0:8})."
+            echo
+            echo "**Merge with \"Create a merge commit\" only**: squash/rebase breaks \"master is an ancestor of hyprland\"."
+            echo
+            echo "## Checklist (PLAN.md, Maintenance procedures (a))"
+            echo "- [ ] \`ipc/types.ts\` / \`KeyToCode.ts\` changes reviewed against \`server.rs\` / \`state.rs::handle_ws_event\`"
+            echo "- [ ] ported \`main/src\` files and \`renderer/src/web/background/IPC.ts\` (Electron UA check) skimmed"
+            echo "- [ ] hyprland-ci green on this branch"
+            echo "- [ ] local: package installed, in-game smoke test"
+            echo
+            echo "## git diff --stat: ipc, main/src, renderer IPC"
+            echo '````'
+            git diff --stat "$base" "$new" -- ipc main/src renderer/src/web/background/IPC.ts
+            echo '````'
+            echo
+            echo "## ipc/types.ts, ipc/KeyToCode.ts"
+            echo '````diff'
+            git diff "$base" "$new" -- ipc/types.ts ipc/KeyToCode.ts
+            echo '````'
+          } > "$body"
+          if [ "$(wc -c < "$body")" -gt 60000 ]; then   # PR body limit is 65536
+            head -c 60000 "$body" > "$body.t"
+            printf '\n````\n\n_Truncated; run locally:_ `git diff %s %s -- ipc/types.ts ipc/KeyToCode.ts`\n' "${base:0:12}" "${new:0:12}" >> "$body.t"
+            mv "$body.t" "$body"
+          fi
+          title="Sync upstream master (${new:0:8})"
+          pr=$(gh pr list --head "$SYNC_BRANCH" --base hyprland --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" --title "$title" --body-file "$body"
+          else
+            gh pr create --base hyprland --head "$SYNC_BRANCH" --title "$title" --body-file "$body" || {
+              echo "::error::PR creation refused: enable Settings > Actions > General > 'Allow GitHub Actions to create and approve pull requests'"
+              exit 1
+            }
+          fi
