@@ -103,8 +103,8 @@ enum Kind {
 enum DeviceMsg {
     Motion,
     Click,
-    /// Raw `REL_WHEEL` value (sign is direction, matching upstream's
-    /// `UiohookWheelEvent.rotation` — see `handle_wheel`), for
+    /// Raw `REL_WHEEL` value (sign is direction, *opposite* to upstream's
+    /// `UiohookWheelEvent.rotation` — see `wheel_tab_right`), for
     /// `stashScroll`.
     Wheel(i32),
     Closed,
@@ -218,6 +218,15 @@ fn is_stash_area(cursor: (f64, f64), at: (i32, i32), size: (i32, i32)) -> bool {
     cy > by + bh * 154.0 / 1600.0 && cy < by + bh * 1192.0 / 1600.0
 }
 
+/// Which tab a wheel notch flips to: `true` = `ArrowRight`. Upstream sends
+/// `ArrowRight` for `rotation > 0`, and libuiohook (uiohook-napi 1.5.x) makes
+/// wheel *down* (towards the user) positive on both X11 (`WheelDown` → `1`)
+/// and Windows (`WHEEL_DELTA / -120`). evdev's `REL_WHEEL` is the other way
+/// round — wheel down is negative — so the sign flips here.
+fn wheel_tab_right(rel_wheel: i32) -> bool {
+    rel_wheel < 0
+}
+
 /// `stashScroll`: ports `Shortcuts.ts`'s `wheel` handler
 /// — `Ctrl` held, the game focused, the feature enabled in config, and the
 /// cursor *outside* the stash grid itself (`is_stash_area`, above) all have
@@ -268,7 +277,7 @@ async fn handle_wheel(delta: i32, modifiers: &ModifierState, overlay: &Weak<Toki
         return; // over the stash grid itself — leave the wheel to the game
     }
 
-    let right = delta > 0;
+    let right = wheel_tab_right(delta);
     eprintln!(
         "ee2-hyprland: stash-scroll: Ctrl+wheel outside stash area, tab {}",
         if right { "right" } else { "left" }
@@ -443,5 +452,12 @@ mod tests {
     fn below_the_vertical_band_is_not_stash_area() {
         // band ends at 155 + 1440 * 1192 / 1600 = 1227.8
         assert!(!is_stash_area((500.0, 1300.0), AT, SIZE));
+    }
+
+    #[test]
+    fn wheel_down_flips_to_the_right_tab_like_upstream() {
+        // evdev REL_WHEEL: -1 = wheel down = uiohook rotation +1 = ArrowRight
+        assert!(wheel_tab_right(-1));
+        assert!(!wheel_tab_right(1));
     }
 }
