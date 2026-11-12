@@ -37,7 +37,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::event::{poll, PollFd, PollFlags};
 use tokio::sync::{mpsc, oneshot};
@@ -55,6 +55,8 @@ use wayland_protocols_wlr::data_control::v1::client::{
 /// How long `receive()` waits for a source client to finish writing an
 /// offered selection before giving up on that one read.
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(3);
+const RECONNECT_AFTER: Duration = Duration::from_secs(2);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Item-text prefixes PoE2 clients emit at the start of copied item text, in
 /// every language upstream supports — ported verbatim from upstream's
@@ -249,7 +251,6 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
             }
             zwlr_data_control_device_v1::Event::PrimarySelection { id: None } => {}
             zwlr_data_control_device_v1::Event::Finished => {
-                ee_log!("clipboard data-control device invalidated (seat removed?), stopping");
                 state.finished = true;
             }
             _ => {}
@@ -355,28 +356,59 @@ pub fn spawn() -> io::Result<mpsc::UnboundedReceiver<ClipboardEvent>> {
     std::thread::Builder::new()
         .name("ee2-hyprland-clipboard".into())
         .spawn(move || {
-            if let Err(err) = run(tx) {
-                ee_log!("clipboard watcher exited: {err}");
+            let mut failed = false;
+            while !tx.is_closed() {
+                let result = run(tx.clone());
+                if let Some(cell) = LAST_TEXT.get() {
+                    *cell.lock().unwrap() = None;
+                }
+                if !failed {
+                    if let Err(err) = result {
+                        ee_log!("clipboard watcher unavailable, retrying: {err}");
+                    }
+                    failed = true;
+                }
+                if !tx.is_closed() {
+                    std::thread::sleep(RECONNECT_AFTER);
+                }
             }
         })?;
 
     let wake = rustix::event::eventfd(0, rustix::event::EventfdFlags::empty())?;
     let queue = Arc::new(WriteQueue {
-        jobs: Mutex::new(VecDeque::new()),
+        state: Mutex::new(WriteQueueState {
+            available: false,
+            jobs: VecDeque::new(),
+        }),
         wake,
     });
     let writer_queue = queue.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("ee2-hyprland-clipboard-write".into())
         .spawn(move || {
-            if let Err(err) = run_writer(writer_queue) {
-                ee_log!("clipboard writer exited: {err}");
+            let mut started = Some(started_tx);
+            let mut failed = false;
+            loop {
+                let result = run_writer(&writer_queue, &mut started);
+                writer_queue.set_available(false);
+                if let Some(tx) = started.take() {
+                    let _ = tx.send(());
+                }
+                if !failed {
+                    if let Err(err) = result {
+                        ee_log!("clipboard writer unavailable, retrying: {err}");
+                    }
+                    failed = true;
+                }
+                std::thread::sleep(RECONNECT_AFTER);
             }
         })?;
     // Only fails if called twice — `spawn()` itself is documented
     // single-call, so a failure here would mean a caller bug, not a
     // runtime condition worth propagating as an `io::Error`.
     let _ = WRITE_QUEUE.set(queue);
+    let _ = started_rx.recv_timeout(WRITE_TIMEOUT);
 
     Ok(rx)
 }
@@ -387,6 +419,13 @@ pub fn spawn() -> io::Result<mpsc::UnboundedReceiver<ClipboardEvent>> {
 struct WriteJob {
     text: String,
     done: oneshot::Sender<io::Result<()>>,
+    deadline: Instant,
+}
+
+impl WriteJob {
+    fn expired(&self) -> bool {
+        self.done.is_closed() || Instant::now() >= self.deadline
+    }
 }
 
 /// The channel between `write_text` (called from tokio tasks) and
@@ -395,8 +434,43 @@ struct WriteJob {
 /// job, which is what wakes `run_writer` out of `poll` without a timer —
 /// same role a self-pipe would play, minus the pipe's two-fd bookkeeping.
 struct WriteQueue {
-    jobs: Mutex<VecDeque<WriteJob>>,
+    state: Mutex<WriteQueueState>,
     wake: OwnedFd,
+}
+
+struct WriteQueueState {
+    available: bool,
+    jobs: VecDeque<WriteJob>,
+}
+
+impl WriteQueue {
+    fn set_available(&self, available: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.available = available;
+        if !available {
+            for job in state.jobs.drain(..) {
+                let _ = job
+                    .done
+                    .send(Err(io::Error::other("clipboard writer disconnected")));
+            }
+        }
+    }
+
+    fn enqueue(&self, job: WriteJob) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state.jobs.retain(|job| !job.expired());
+        if !state.available {
+            return Err(io::Error::other("clipboard writer unavailable"));
+        }
+        state.jobs.push_back(job);
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<WriteJob> {
+        let mut state = self.state.lock().unwrap();
+        state.jobs.retain(|job| !job.expired());
+        state.jobs.pop_front()
+    }
 }
 
 /// Set once, by `spawn()`, before any real `write_text` call can happen
@@ -422,7 +496,9 @@ static LAST_TEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 /// registry/seat/manager handling is identical: keeping the two connections
 /// and their `Dispatch` impls independent means neither loop's state or
 /// timing assumptions leak into the other.
-struct WriterState;
+struct WriterState {
+    finished: bool,
+}
 
 impl Dispatch<WlRegistry, GlobalListContents> for WriterState {
     fn event(
@@ -462,7 +538,7 @@ impl Dispatch<ZwlrDataControlManagerV1, ()> for WriterState {
 
 impl Dispatch<ZwlrDataControlDeviceV1, ()> for WriterState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &ZwlrDataControlDeviceV1,
         event: zwlr_data_control_device_v1::Event,
         _: &(),
@@ -478,8 +554,10 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for WriterState {
         // connection's whole lifetime. `Selection`/`PrimarySelection`
         // reference that *same* already-destroyed id, not a new one, so
         // there's nothing left to do when those arrive.
-        if let zwlr_data_control_device_v1::Event::DataOffer { id } = event {
-            id.destroy();
+        match event {
+            zwlr_data_control_device_v1::Event::DataOffer { id } => id.destroy(),
+            zwlr_data_control_device_v1::Event::Finished => state.finished = true,
+            _ => {}
         }
     }
 
@@ -524,6 +602,7 @@ impl Dispatch<ZwlrDataControlSourceV1, Mutex<String>> for WriterState {
                 // Closing `file` (end of scope) drops the fd, which is the
                 // EOF signal the reading side (the game, `wl-paste`, a
                 // clipboard manager) is waiting for.
+                // shortcut: a non-reading client can block this thread; use bounded pipe writes if observed.
                 let mut file = std::fs::File::from(fd);
                 if let Err(err) = file.write_all(text.as_bytes()) {
                     ee_log!("clipboard write: failed to write paste data: {err}");
@@ -573,7 +652,10 @@ const OWN_WRITE_MARKER_MIME: &str = "application/x-ee2-hyprland-own-write";
 /// describe for `EventQueue::prepare_read`, just with a second fd folded
 /// into the same `poll` call instead of only ever waiting on the
 /// connection.
-fn run_writer(queue: Arc<WriteQueue>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_writer(
+    queue: &WriteQueue,
+    started: &mut Option<std::sync::mpsc::SyncSender<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let conn = Connection::connect_to_env()?;
     let (globals, mut event_queue) = registry_queue_init::<WriterState>(&conn)?;
     let qh = event_queue.handle();
@@ -582,17 +664,31 @@ fn run_writer(queue: Arc<WriteQueue>) -> Result<(), Box<dyn std::error::Error>> 
     let manager: ZwlrDataControlManagerV1 = globals.bind(&qh, 1..=2, ())?;
     let device = manager.get_data_device(&seat, &qh, ());
 
-    let mut state = WriterState;
+    let mut state = WriterState { finished: false };
+    event_queue.roundtrip(&mut state)?;
+    if state.finished {
+        return Err("data-control writer invalidated (Finished event)".into());
+    }
+    queue.set_available(true);
+    if let Some(tx) = started.take() {
+        let _ = tx.send(());
+    }
 
     loop {
         event_queue.dispatch_pending(&mut state)?;
+        if state.finished {
+            return Err("data-control writer invalidated (Finished event)".into());
+        }
         conn.flush()?;
 
         // Handing off queued jobs here (rather than only right after the
         // wake fd is seen readable) covers the case where a job was pushed
         // between the loop's last wait and this point — checking
         // unconditionally on every pass means that race can't drop a job.
-        while let Some(job) = queue.jobs.lock().unwrap().pop_front() {
+        while let Some(job) = queue.pop() {
+            if job.expired() {
+                continue;
+            }
             let source = manager.create_data_source(&qh, Mutex::new(job.text));
             for mime in OFFERED_MIME_TYPES {
                 source.offer(mime.to_string());
@@ -619,6 +715,12 @@ fn run_writer(queue: Arc<WriteQueue>) -> Result<(), Box<dyn std::error::Error>> 
         ];
         poll(&mut fds, None)?;
 
+        if fds.iter().any(|fd| {
+            fd.revents()
+                .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL)
+        }) {
+            return Err("clipboard writer poll disconnected".into());
+        }
         if fds[1].revents().contains(PollFlags::IN) {
             // Drain the eventfd counter — left unread, it stays readable
             // and `poll` would return immediately forever after.
@@ -626,7 +728,7 @@ fn run_writer(queue: Arc<WriteQueue>) -> Result<(), Box<dyn std::error::Error>> 
             let _ = rustix::io::read(&queue.wake, &mut buf);
         }
         if fds[0].revents().contains(PollFlags::IN) {
-            let _ = read_guard.read();
+            read_guard.read()?;
         } else {
             drop(read_guard);
         }
@@ -796,14 +898,20 @@ async fn write_text_native(text: &str) -> io::Result<()> {
     let queue = WRITE_QUEUE
         .get()
         .ok_or_else(|| io::Error::other("clipboard writer not started (spawn() not called yet)"))?;
+    write_with_queue(queue, text, WRITE_TIMEOUT).await
+}
+
+async fn write_with_queue(queue: &WriteQueue, text: &str, timeout: Duration) -> io::Result<()> {
     let (done_tx, done_rx) = oneshot::channel();
-    queue.jobs.lock().unwrap().push_back(WriteJob {
+    queue.enqueue(WriteJob {
         text: text.to_string(),
         done: done_tx,
-    });
+        deadline: Instant::now() + timeout,
+    })?;
     rustix::io::write(&queue.wake, &1u64.to_ne_bytes())?;
-    done_rx
+    tokio::time::timeout(timeout, done_rx)
         .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "clipboard write timed out"))?
         .map_err(|_| io::Error::other("clipboard writer thread exited"))?
 }
 
@@ -873,6 +981,67 @@ pub async fn read_item_text(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offline_queue() -> WriteQueue {
+        WriteQueue {
+            state: Mutex::new(WriteQueueState {
+                available: false,
+                jobs: VecDeque::new(),
+            }),
+            wake: rustix::event::eventfd(0, rustix::event::EventfdFlags::empty()).unwrap(),
+        }
+    }
+
+    fn job(text: &str, timeout: Duration) -> (WriteJob, oneshot::Receiver<io::Result<()>>) {
+        let (done, rx) = oneshot::channel();
+        (
+            WriteJob {
+                text: text.into(),
+                done,
+                deadline: Instant::now() + timeout,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn offline_disconnect_drains_and_recovery_accepts_only_new_jobs() {
+        let queue = offline_queue();
+        let (rejected, _) = job("unavailable", WRITE_TIMEOUT);
+        assert!(queue.enqueue(rejected).is_err());
+        queue.set_available(true);
+        let (pending, result) = job("before disconnect", WRITE_TIMEOUT);
+        queue.enqueue(pending).unwrap();
+        queue.set_available(false);
+        assert!(result.await.unwrap().is_err());
+        queue.set_available(true);
+        assert!(queue.pop().is_none());
+        let (fresh, result) = job("after recovery", WRITE_TIMEOUT);
+        queue.enqueue(fresh).unwrap();
+        let fresh = queue.pop().unwrap();
+        assert_eq!(fresh.text, "after recovery");
+        fresh.done.send(Ok(())).unwrap();
+        assert!(result.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn offline_timeout_and_closed_jobs_are_never_replayed() {
+        let queue = offline_queue();
+        queue.set_available(true);
+        let err = write_with_queue(&queue, "timed out", Duration::from_millis(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(queue.pop().is_none());
+        let (closed, result) = job("cancelled", WRITE_TIMEOUT);
+        queue.enqueue(closed).unwrap();
+        drop(result);
+        let (expired, result) = job("expired", Duration::ZERO);
+        queue.enqueue(expired).unwrap();
+        assert!(queue.pop().is_none());
+        assert!(result.await.is_err());
+        assert!(queue.state.lock().unwrap().jobs.is_empty());
+    }
 
     /// The test harness runs `#[tokio::test]`s in parallel by default (each
     /// on its own OS thread), but every test in this module drives the

@@ -188,16 +188,20 @@ pub fn set_visible(window: &gtk4::ApplicationWindow, visible: bool) {
     window.set_visible(visible);
 }
 
-/// The monitor this window's surface actually landed on — the game's
-/// monitor once `set_monitor_by_origin` has pinned it, otherwise whichever
-/// output the compositor assigned by default. Falls back to the display's first
+/// The explicitly pinned monitor, otherwise whichever output the compositor
+/// assigned to the surface. Falls back to the display's first
 /// monitor if the surface isn't realized yet (mirrors
 /// `window_size_or_monitor_fallback`'s own fallback).
 fn current_monitor(window: &gtk4::ApplicationWindow) -> Option<gdk::Monitor> {
     let display = gtk4::prelude::RootExt::display(window);
     window
-        .surface()
-        .and_then(|surface| display.monitor_at_surface(&surface))
+        .monitor()
+        // Surface output information can lag behind a layer-shell monitor change.
+        .or_else(|| {
+            window
+                .surface()
+                .and_then(|surface| display.monitor_at_surface(&surface))
+        })
         .or_else(|| display.monitors().item(0)?.downcast::<gdk::Monitor>().ok())
 }
 

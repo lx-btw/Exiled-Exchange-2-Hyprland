@@ -19,15 +19,16 @@
 //! Also reads `REL_WHEEL` off the same devices for `stashScroll`
 //! (`handle_wheel`).
 
+use crate::input::devices::{DeviceId, Devices};
+use std::collections::HashSet;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
 use std::sync::{Arc, Weak};
 
 use evdev::{Device, EventSummary, KeyCode, RelativeAxisCode};
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
 use crate::compositor;
-use crate::input::hotkeys::ModifierState;
+use crate::input::hotkeys::{ModifierState, MIRROR_KEYBOARD_NAME};
 use crate::input::inject::VIRTUAL_KEYBOARD_NAME;
 use crate::input::keymap::Modifier;
 use crate::state::{self, Overlay};
@@ -80,16 +81,18 @@ pub type Handle = mpsc::UnboundedSender<Cmd>;
 /// report) except this fork's own virtual device — mirrors
 /// `hotkeys::open_keyboards`'s exclusion, even though today that device only
 /// advertises keys, not relative axes, in case that ever changes.
-fn open_mice() -> Vec<Device> {
+fn open_mice() -> Vec<(std::path::PathBuf, Device)> {
     evdev::enumerate()
-        .filter_map(|(_path, device)| {
-            if device.name() == Some(VIRTUAL_KEYBOARD_NAME) {
+        .filter_map(|(path, device)| {
+            if device.name() == Some(VIRTUAL_KEYBOARD_NAME)
+                || device.name() == Some(MIRROR_KEYBOARD_NAME)
+            {
                 return None;
             }
             let is_mouse = device.supported_relative_axes().is_some_and(|axes| {
                 axes.contains(RelativeAxisCode::REL_X) && axes.contains(RelativeAxisCode::REL_Y)
             });
-            is_mouse.then_some(device)
+            is_mouse.then_some((path, device))
         })
         .collect()
 }
@@ -285,67 +288,20 @@ async fn handle_wheel(delta: i32, modifiers: &ModifierState, overlay: &Weak<Toki
     state::inject_stash_scroll_tab(overlay, right).await;
 }
 
-/// Runs until `cmd_rx` closes (process shutdown). Owns every mouse-like
-/// input device found at startup — like `hotkeys::watch`, this doesn't
-/// handle devices plugged in later.
+/// Runs until `cmd_rx` closes (process shutdown). Discovers mouse-like
+/// input devices every second, including devices connected after startup.
 pub async fn watch(
     overlay: Weak<TokioMutex<Overlay>>,
     modifiers: Arc<ModifierState>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
 ) {
-    let devices = open_mice();
-    if devices.is_empty() {
-        eprintln!("ee2-hyprland: no mouse-like /dev/input device found — hover price-check tracking disabled");
-        return;
-    }
+    let (dev_tx, mut dev_rx) = mpsc::unbounded_channel::<(DeviceId, DeviceMsg)>();
 
-    let (dev_tx, mut dev_rx) = mpsc::unbounded_channel::<(RawFd, DeviceMsg)>();
-
-    for device in devices {
-        let fd = device.as_raw_fd();
-        let dev_tx = dev_tx.clone();
-        let mut stream = match device.into_event_stream() {
-            Ok(stream) => stream,
-            Err(err) => {
-                eprintln!("ee2-hyprland: failed to open mouse device for async reads: {err}");
-                continue;
-            }
-        };
-        tokio::spawn(async move {
-            loop {
-                match stream.next_event().await {
-                    Ok(event) => {
-                        let msg = match event.destructure() {
-                            EventSummary::RelativeAxis(_, axis, _)
-                                if axis == RelativeAxisCode::REL_X
-                                    || axis == RelativeAxisCode::REL_Y =>
-                            {
-                                Some(DeviceMsg::Motion)
-                            }
-                            EventSummary::RelativeAxis(_, axis, value)
-                                if axis == RelativeAxisCode::REL_WHEEL =>
-                            {
-                                Some(DeviceMsg::Wheel(value))
-                            }
-                            EventSummary::Key(_, KeyCode::BTN_LEFT, 1) => Some(DeviceMsg::Click),
-                            _ => None,
-                        };
-                        if let Some(msg) = msg {
-                            if dev_tx.send((fd, msg)).is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("ee2-hyprland: mouse device read error: {err}");
-                        let _ = dev_tx.send((fd, DeviceMsg::Closed));
-                        return;
-                    }
-                }
-            }
-        });
-    }
-    drop(dev_tx);
+    let mut devices = Devices::default();
+    let mut first_scan = true;
+    let mut failed_streams = HashSet::new();
+    let mut discovery = tokio::time::interval(std::time::Duration::from_secs(1));
+    discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut session: Option<Session> = None;
     let (pos_tx, mut pos_rx) = mpsc::unbounded_channel::<(Kind, io::Result<(i32, i32)>)>();
@@ -354,6 +310,62 @@ pub async fn watch(
 
     loop {
         tokio::select! {
+            _ = discovery.tick() => {
+                let mice = open_mice();
+                if first_scan && mice.is_empty() {
+                    eprintln!("ee2-hyprland: no mouse-like /dev/input device found — retrying every second");
+                }
+                first_scan = false;
+                for (path, device) in mice {
+                    let Some(fd) = devices.attach(&path) else { continue };
+                    let dev_tx = dev_tx.clone();
+                    let mut stream = match device.into_event_stream() {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            if failed_streams.insert(path.clone()) {
+                                eprintln!("ee2-hyprland: failed to open mouse device for async reads ({}): {err}", path.display());
+                            }
+                            devices.remove(fd);
+                            continue;
+                        }
+                    };
+                    failed_streams.remove(&path);
+                    eprintln!("ee2-hyprland: input: attached mouse reader {fd} ({})", path.display());
+                    tokio::spawn(async move {
+                        loop {
+                            match stream.next_event().await {
+                                Ok(event) => {
+                                    let msg = match event.destructure() {
+                                        EventSummary::RelativeAxis(_, axis, _)
+                                            if axis == RelativeAxisCode::REL_X
+                                                || axis == RelativeAxisCode::REL_Y =>
+                                        {
+                                            Some(DeviceMsg::Motion)
+                                        }
+                                        EventSummary::RelativeAxis(_, axis, value)
+                                            if axis == RelativeAxisCode::REL_WHEEL =>
+                                        {
+                                            Some(DeviceMsg::Wheel(value))
+                                        }
+                                        EventSummary::Key(_, KeyCode::BTN_LEFT, 1) => Some(DeviceMsg::Click),
+                                        _ => None,
+                                    };
+                                    if let Some(msg) = msg {
+                                        if dev_tx.send((fd, msg)).is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("ee2-hyprland: mouse device read error: {err}");
+                                    let _ = dev_tx.send((fd, DeviceMsg::Closed));
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(Cmd::Start(s)) => {
@@ -368,11 +380,12 @@ pub async fn watch(
                 }
             }
             msg = dev_rx.recv() => {
-                let Some((_fd, msg)) = msg else { continue };
+                let Some((id, msg)) = msg else { continue };
+                if !devices.contains(id) { continue; }
                 let kind = match msg {
                     DeviceMsg::Motion => Kind::Move,
                     DeviceMsg::Click => Kind::Click,
-                    DeviceMsg::Closed => continue,
+                    DeviceMsg::Closed => { devices.remove(id); continue; },
                     DeviceMsg::Wheel(delta) => {
                         // Independent of the hover-tracking `session`
                         // above (`stashScroll` isn't gated on any widget

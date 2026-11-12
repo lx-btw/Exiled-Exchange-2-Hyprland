@@ -46,7 +46,7 @@
 //!   own independent (always `us`-default) XKB state, and releasing the
 //!   grab hands the physical device back whatever layout the user last
 //!   toggled to while typing through the mirror.
-//! - No timers anywhere in this path. `evdev::Device` ungrabs itself on
+//! - Discovery rescans once a second; capture transitions remain event driven. `evdev::Device` ungrabs itself on
 //!   `Drop`, and `EVIOCGRAB` is fd-scoped kernel state the kernel already
 //!   releases on any process exit, `SIGKILL` included.
 //! - **Known limitation, not implemented**: Caps Lock / Num Lock LED state
@@ -70,9 +70,9 @@
 //!
 //! Design rationale: HYPRLAND-NOTES.md §3, §8.
 
+use super::devices::{DeviceId, Devices};
 use crate::logger::ee_log;
 use std::collections::HashSet;
-use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -80,6 +80,7 @@ use evdev::{Device, EventSummary, KeyCode};
 use tokio::sync::{mpsc, watch};
 
 use super::grab::Capture;
+pub(crate) use super::grab::MIRROR_KEYBOARD_NAME;
 use super::inject::VIRTUAL_KEYBOARD_NAME;
 use super::keymap::{Modifier, Shortcut};
 
@@ -91,7 +92,7 @@ use super::keymap::{Modifier, Shortcut};
 /// stays open the whole time; only this list is swapped out.
 pub type Bindings = Arc<Mutex<Vec<(Shortcut, usize)>>>;
 
-fn is_held(held: &HashSet<(RawFd, KeyCode)>, codes: [KeyCode; 2]) -> bool {
+fn is_held(held: &HashSet<(DeviceId, KeyCode)>, codes: [KeyCode; 2]) -> bool {
     held.iter().any(|(_, k)| codes.contains(k))
 }
 
@@ -124,7 +125,7 @@ impl ModifierState {
         self.alt.load(Ordering::Relaxed)
     }
 
-    fn update(&self, held: &HashSet<(RawFd, KeyCode)>) {
+    fn update(&self, held: &HashSet<(DeviceId, KeyCode)>) {
         self.ctrl
             .store(is_held(held, Modifier::Ctrl.keycodes()), Ordering::Relaxed);
         self.alt
@@ -141,29 +142,25 @@ impl ModifierState {
 /// matcher below (and, for capture, straight back into the grab-candidate
 /// list as if a second physical keyboard had appeared) — a self-triggering
 /// feedback loop.
-fn open_keyboards() -> Vec<Device> {
+fn open_keyboards() -> Vec<(std::path::PathBuf, Device)> {
     evdev::enumerate()
-        .filter_map(|(_path, device)| {
+        .filter_map(|(path, device)| {
             let name = device.name();
-            if name == Some(VIRTUAL_KEYBOARD_NAME)
-                || name == Some(super::grab::MIRROR_KEYBOARD_NAME)
-            {
+            if name == Some(VIRTUAL_KEYBOARD_NAME) || name == Some(MIRROR_KEYBOARD_NAME) {
                 return None;
             }
             let is_keyboard = device
                 .supported_keys()
                 .is_some_and(|keys| keys.contains(KeyCode::KEY_A));
-            is_keyboard.then_some(device)
+            is_keyboard.then_some((path, device))
         })
         .collect()
 }
 
 /// Watches `bindings` (parsed shortcut, opaque index into the caller's own
 /// action list — read fresh on every keydown, so updating it takes effect
-/// immediately) across every keyboard device present at startup, and sends
-/// the matching index over `tx` each time one fires. Runs until every
-/// keyboard device errors out or is unplugged (devices plugged in after
-/// startup are not picked up until a restart).
+/// immediately) across every connected keyboard device, and sends
+/// the matching index over `tx` each time one fires. New devices and delayed device permissions are discovered every second.
 ///
 /// `game_active` (`state.rs`'s `hotkeys_active`, updated from
 /// `set_game_active`) gates both matching and capture: ports upstream's
@@ -188,19 +185,11 @@ pub async fn watch(
     tx: mpsc::UnboundedSender<usize>,
     close_overlay_tx: mpsc::UnboundedSender<()>,
 ) {
-    let devices = open_keyboards();
-    if devices.is_empty() {
-        eprintln!("ee2-hyprland: no keyboard-like /dev/input device found — hotkeys disabled");
-        return;
-    }
-
-    // `Capture::new` needs to read every device's name/capabilities before
-    // any of them are moved into their own reader task below. A failure
-    // here (uinput unavailable, permission denied) degrades to no capture
+    // A failure here (uinput unavailable, permission denied) degrades to no capture
     // — hotkeys still match and fire, they just never grab anything, so a
     // hotkey's trigger key also reaches the game — rather than taking the
     // whole hotkey listener down with it.
-    let mut capture = match Capture::new(&devices) {
+    let mut capture = match Capture::new() {
         Ok(capture) => Some(capture),
         Err(err) => {
             ee_log!(
@@ -214,7 +203,8 @@ pub async fn watch(
 
     enum DeviceMsg {
         Event(evdev::InputEvent),
-        // The reader for this fd exited (error or unplug) — the central
+        Grabbed { requested: bool, grabbed: bool },
+        // The reader for this ID exited (error or unplug) — the central
         // loop must drop every `held` entry for it, or a modifier physically
         // released on that now-gone device would stay "held" forever and
         // spuriously satisfy every shortcut requiring it, sourced from any
@@ -222,93 +212,136 @@ pub async fn watch(
         Closed,
     }
 
-    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<(RawFd, DeviceMsg)>();
-    let mut fds: Vec<RawFd> = Vec::new();
-
-    for device in devices {
-        let fd = device.as_raw_fd();
-        fds.push(fd);
-        let events_tx = events_tx.clone();
-
-        // Always created, even when capture is disabled: the receiver is
-        // moved into the reader task below either way, but its branch is
-        // gated on `capture_enabled` (see that task) so it's never polled
-        // when there's no sender registered anywhere to feed it — polling
-        // a channel whose only sender was just dropped returns `None`
-        // forever, which would busy-loop `select!` without that guard.
-        let (grab_tx, mut grab_rx) = mpsc::unbounded_channel::<bool>();
-        if let Some(capture) = capture.as_mut() {
-            capture.register_device(fd, grab_tx);
-        }
-
-        let mut stream = match device.into_event_stream() {
-            Ok(stream) => stream,
-            Err(err) => {
-                ee_log!("failed to open input device for async reads: {err}");
-                continue;
-            }
-        };
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    event = stream.next_event() => {
-                        match event {
-                            Ok(event) => {
-                                if events_tx.send((fd, DeviceMsg::Event(event))).is_err() {
-                                    return;
-                                }
-                            }
-                            Err(err) => {
-                                ee_log!("input device read error: {err}");
-                                let _ = events_tx.send((fd, DeviceMsg::Closed));
-                                return;
-                            }
-                        }
-                    }
-                    Some(want_grabbed) = grab_rx.recv(), if capture_enabled => {
-                        // The grab/ungrab syscall itself: only this task
-                        // owns the `Device` handle for this fd, so the
-                        // central loop below can only ask for it via this
-                        // channel, never perform it directly.
-                        let result = if want_grabbed {
-                            stream.device_mut().grab()
-                        } else {
-                            stream.device_mut().ungrab()
-                        };
-                        if let Err(err) = result {
-                            ee_log!(
-                                "failed to {} input device: {err}",
-                                if want_grabbed { "grab" } else { "ungrab" }
-                            );
-                        }
-                    }
-                }
-            }
-        });
-    }
-    drop(events_tx);
-
-    let mut held: HashSet<(RawFd, KeyCode)> = HashSet::new();
-
-    // Engage capture immediately if the game is already focused when this
-    // starts — don't wait for the first keystroke to notice (that keystroke
-    // would otherwise leak straight through to the game).
-    if let Some(capture) = capture.as_mut() {
-        let active = *game_active.borrow();
-        capture.recheck_all(&fds, active, &held).await;
-    }
+    let (events_tx, mut events_rx) = mpsc::unbounded_channel::<(DeviceId, DeviceMsg)>();
+    let mut devices = Devices::default();
+    let mut first_scan = true;
+    let mut failed_streams = HashSet::new();
+    let mut held: HashSet<(DeviceId, KeyCode)> = HashSet::new();
+    let mut discovery = tokio::time::interval(std::time::Duration::from_secs(1));
+    discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = discovery.tick() => {
+                let keyboards = open_keyboards();
+                if first_scan && keyboards.is_empty() {
+                    ee_log!("no keyboard-like /dev/input device found — retrying every second");
+                }
+                first_scan = false;
+                for (path, device) in keyboards {
+                    let Some(fd) = devices.attach(&path) else { continue };
+                    // A failed state query must never allow grabbing a possibly held keyboard.
+                    let initial = match device.get_key_state() {
+                        Ok(keys) => keys,
+                        Err(_) => { devices.remove(fd); continue; }
+                    };
+                    held.extend(initial.iter().map(|key| (fd, key)));
+                    modifiers.update(&held);
+                    let mirrorable = super::devices::is_physical(&path) && super::grab::can_mirror(&device);
+                    let name = device.name().map(str::to_owned);
+                    let events_tx = events_tx.clone();
+
+                    // Always created, even when capture is disabled: the receiver is
+                    // moved into the reader task below either way, but its branch is
+                    // gated on `capture_enabled` (see that task) so it's never polled
+                    // when there's no sender registered anywhere to feed it — polling
+                    // a channel whose only sender was just dropped returns `None`
+                    // forever, which would busy-loop `select!` without that guard.
+                    let (grab_tx, mut grab_rx) = mpsc::unbounded_channel::<bool>();
+
+                    let mut stream = match device.into_event_stream() {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            if failed_streams.insert(path.clone()) {
+                                ee_log!("failed to open input device for async reads ({}): {err}", path.display());
+                            }
+                            devices.remove(fd);
+                            held.retain(|(id, _)| *id != fd);
+                            modifiers.update(&held);
+                            continue;
+                        }
+                    };
+                    failed_streams.remove(&path);
+                    ee_log!("input: attached keyboard reader {fd} ({}, capture={})", path.display(), mirrorable && capture_enabled);
+                    if mirrorable {
+                        if let Some(capture) = capture.as_mut() {
+                            capture.register_device(fd, name.as_deref(), grab_tx);
+                        }
+                    }
+                    tokio::spawn(async move {
+                        let mut reported_grab_error = false;
+                        loop {
+                            tokio::select! {
+                                event = stream.next_event() => {
+                                    match event {
+                                        Ok(event) => {
+                                            if events_tx.send((fd, DeviceMsg::Event(event))).is_err() {
+                                                return;
+                                            }
+                                        }
+                                        Err(err) => {
+                                            ee_log!("input device read error: {err}");
+                                            let _ = events_tx.send((fd, DeviceMsg::Closed));
+                                            return;
+                                        }
+                                    }
+                                }
+                                Some(want_grabbed) = grab_rx.recv(), if capture_enabled && mirrorable => {
+                                    // The grab/ungrab syscall itself: only this task
+                                    // owns the `Device` handle for this fd, so the
+                                    // central loop below can only ask for it via this
+                                    // channel, never perform it directly.
+                                    // Recheck at the syscall boundary: keys may have changed
+                                    // since discovery or the central loop's last event.
+                                    let idle = stream.device().get_key_state().is_ok_and(|keys| keys.iter().next().is_none());
+                                    let grabbed = if !idle {
+                                        !want_grabbed
+                                    } else {
+                                        let result = if want_grabbed { stream.device_mut().grab() } else { stream.device_mut().ungrab() };
+                                        match result {
+                                            Ok(()) => { reported_grab_error = false; want_grabbed }
+                                            Err(err) => {
+                                                if !reported_grab_error {
+                                                    ee_log!("capture: reader {fd} failed to change grab state: {err}");
+                                                    reported_grab_error = true;
+                                                }
+                                                !want_grabbed
+                                            }
+                                        }
+                                    };
+                                    if events_tx.send((fd, DeviceMsg::Grabbed { requested: want_grabbed, grabbed })).is_err() { return; }
+                                }
+                            }
+                        }
+                    });
+                }
+                if let Some(capture) = capture.as_mut() {
+                    let active = *game_active.borrow();
+                    capture.recheck_all(&devices.ids(), active, &held).await;
+                }
+            }
             msg = events_rx.recv() => {
                 let Some((fd, msg)) = msg else { break };
 
+                if !devices.contains(fd) { continue; }
                 let event = match msg {
                     DeviceMsg::Closed => {
+                        devices.remove(fd);
                         held.retain(|(held_fd, _)| *held_fd != fd);
                         modifiers.update(&held);
                         if let Some(capture) = capture.as_mut() {
                             capture.forget_device(fd);
+                        }
+                        continue;
+                    }
+                    DeviceMsg::Grabbed { requested, grabbed } => {
+                        if let Some(capture) = capture.as_mut() {
+                            capture.acknowledge(fd, grabbed);
+                            let active = *game_active.borrow();
+                            // Reconcile focus changes during the command, without retrying failed grabs in a tight loop.
+                            if active != requested {
+                                capture.maybe_transition(fd, active, &held).await;
+                            }
                         }
                         continue;
                     }
@@ -378,7 +411,7 @@ pub async fn watch(
                             if consumed {
                                 capture.mark_eaten(fd, code);
                             } else if grabbed {
-                                capture.forward(code, 1);
+                                capture.forward(fd, code, 1);
                             }
                         }
                     }
@@ -387,7 +420,7 @@ pub async fn watch(
                             let eaten = capture.as_ref().is_some_and(|c| c.is_eaten(fd, code));
                             if !eaten {
                                 if let Some(capture) = capture.as_mut() {
-                                    capture.forward(code, 2);
+                                    capture.forward(fd, code, 2);
                                 }
                             }
                         }
@@ -400,7 +433,7 @@ pub async fn watch(
                             let eaten = capture.as_mut().is_some_and(|c| c.take_eaten(fd, code));
                             if !eaten {
                                 if let Some(capture) = capture.as_mut() {
-                                    capture.forward(code, 0);
+                                    capture.forward(fd, code, 0);
                                 }
                             }
                         }
@@ -423,7 +456,7 @@ pub async fn watch(
                 }
                 if let Some(capture) = capture.as_mut() {
                     let active = *game_active.borrow();
-                    capture.recheck_all(&fds, active, &held).await;
+                    capture.recheck_all(&devices.ids(), active, &held).await;
                 }
             }
         }
@@ -433,6 +466,30 @@ pub async fn watch(
 #[cfg(test)]
 mod tests {
     use super::super::keymap::parse_shortcut;
+
+    #[test]
+    fn attachment_and_removal_preserve_other_keyboard_modifiers() {
+        use super::{DeviceId, ModifierState};
+        use evdev::KeyCode;
+        use std::collections::HashSet;
+        let modifiers = ModifierState::new();
+        let mut held: HashSet<(DeviceId, KeyCode)> = [
+            (1, KeyCode::KEY_LEFTCTRL),
+            (1, KeyCode::KEY_LEFTALT),
+            (2, KeyCode::KEY_RIGHTCTRL),
+        ]
+        .into_iter()
+        .collect();
+        modifiers.update(&held);
+        assert!(modifiers.ctrl() && modifiers.alt());
+        held.retain(|(id, _)| *id != 1);
+        modifiers.update(&held);
+        assert!(modifiers.ctrl());
+        assert!(!modifiers.alt());
+        held.clear();
+        modifiers.update(&held);
+        assert!(!modifiers.ctrl());
+    }
 
     #[test]
     fn price_check_hold_combo_matches_upstream_default() {

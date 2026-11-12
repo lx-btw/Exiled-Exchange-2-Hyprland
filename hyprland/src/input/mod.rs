@@ -2,6 +2,7 @@
 //! injection (`inject.rs`), and the shortcut-string ↔ evdev-keycode table
 //! (`keymap.rs`) they share.
 
+pub(crate) mod devices;
 mod grab;
 pub mod hotkeys;
 pub mod inject;

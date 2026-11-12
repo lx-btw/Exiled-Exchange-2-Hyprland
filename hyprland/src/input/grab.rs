@@ -10,13 +10,13 @@
 //! mangling `hypr_device_name()` reproduces, and why `switchxkblayout` has
 //! to be sent without a `dispatch` prefix).
 
+use super::devices::DeviceId;
 use crate::logger::ee_log;
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
 
 use evdev::uinput::VirtualDevice;
-use evdev::{AttributeSet, Device, EventType, InputEvent, KeyCode};
+use evdev::{AttributeSet, EventType, InputEvent, KeyCode};
 use tokio::sync::mpsc;
 
 use crate::compositor;
@@ -38,23 +38,9 @@ struct Mirror {
 }
 
 impl Mirror {
-    /// `keyboards` is every physical device about to be watched, read
-    /// *before* any of them are moved into their own reader task — the
-    /// mirror's capability set is the union of everything they can each
-    /// individually produce, not `keymap.rs`'s curated `KEY_TABLE` (which
-    /// has no punctuation/symbol keys, and would silently drop them from
-    /// chat text typed through a grabbed keyboard). `uinput` requires the
-    /// full capability set declared upfront, same constraint
-    /// `inject.rs::VirtualKeyboard::new()` documents.
-    fn new(keyboards: &[Device]) -> io::Result<Self> {
-        let mut keys = AttributeSet::<KeyCode>::new();
-        for device in keyboards {
-            if let Some(supported) = device.supported_keys() {
-                for key in supported.iter() {
-                    keys.insert(key);
-                }
-            }
-        }
+    // Declare all known keyboard keys once, including keys on future keyboards.
+    fn new() -> io::Result<Self> {
+        let keys = mirror_keys();
 
         let device = VirtualDevice::builder()?
             .name(MIRROR_KEYBOARD_NAME)
@@ -75,6 +61,43 @@ impl Mirror {
             ee_log!("mirror device emit failed: {err}");
         }
     }
+}
+
+fn mirror_keys() -> AttributeSet<KeyCode> {
+    (1..0x300)
+        .map(KeyCode::new)
+        .filter(|key| format!("{key:?}").starts_with("KEY_"))
+        .collect()
+}
+
+pub(super) fn can_mirror(device: &evdev::Device) -> bool {
+    let keys = mirror_keys();
+    if device
+        .supported_relative_axes()
+        .is_some_and(|axes| axes.iter().next().is_some())
+    {
+        return false;
+    }
+    device
+        .supported_keys()
+        .is_some_and(|supported| supported.iter().all(|key| keys.contains(key)))
+}
+
+// A shared mirror must release a key only after its last physical holder.
+fn update_mirrored(
+    held: &mut HashSet<(DeviceId, KeyCode)>,
+    id: DeviceId,
+    code: KeyCode,
+    value: i32,
+) -> bool {
+    if value == 1 {
+        held.insert((id, code));
+    }
+    if value == 0 {
+        held.remove(&(id, code));
+        return !held.iter().any(|(_, key)| *key == code);
+    }
+    true
 }
 
 /// Hyprland's own device-name mangling (`keyboards[].name` in `hyprctl -j
@@ -169,71 +192,97 @@ async fn sync_physical_to_mirror(hypr_name: &str) {
 /// trigger key, held down — its repeat/release must stay eaten too).
 pub struct Capture {
     mirror: Mirror,
-    names: HashMap<RawFd, String>,
-    senders: HashMap<RawFd, mpsc::UnboundedSender<bool>>,
-    grabbed: HashMap<RawFd, bool>,
-    eaten: HashMap<RawFd, HashSet<KeyCode>>,
+    names: HashMap<DeviceId, String>,
+    senders: HashMap<DeviceId, mpsc::UnboundedSender<bool>>,
+    grabbed: HashMap<DeviceId, bool>,
+    eaten: HashMap<DeviceId, HashSet<KeyCode>>,
+    mirrored: HashSet<(DeviceId, KeyCode)>,
+    pending: HashSet<DeviceId>,
 }
 
 impl Capture {
-    /// `devices` must be every device `hotkeys.rs::open_keyboards()` is
-    /// about to watch, read before any of them are moved into their own
-    /// reader task (same requirement `Mirror::new` has, for the same
-    /// reason).
-    pub fn new(devices: &[Device]) -> io::Result<Self> {
-        let mirror = Mirror::new(devices)?;
-        let mut names = HashMap::new();
-        for device in devices {
-            if let Some(name) = device.name() {
-                names.insert(device.as_raw_fd(), hypr_device_name(name));
-            }
-        }
+    pub fn new() -> io::Result<Self> {
+        let mirror = Mirror::new()?;
+        let names = HashMap::new();
         Ok(Self {
             mirror,
             names,
             senders: HashMap::new(),
             grabbed: HashMap::new(),
             eaten: HashMap::new(),
+            mirrored: HashSet::new(),
+            pending: HashSet::new(),
         })
     }
 
     /// Registers `fd`'s reader task's grab-command channel — must be called
     /// once per device, right after that device's reader task is spawned
     /// (`hotkeys.rs::watch()`), before any transition can target it.
-    pub fn register_device(&mut self, fd: RawFd, sender: mpsc::UnboundedSender<bool>) {
+    pub fn register_device(
+        &mut self,
+        fd: DeviceId,
+        name: Option<&str>,
+        sender: mpsc::UnboundedSender<bool>,
+    ) {
+        if let Some(name) = name {
+            self.names.insert(fd, hypr_device_name(name));
+        }
         self.senders.insert(fd, sender);
     }
 
     /// Drops every entry for `fd` — called when that device's reader task
     /// exits (error or unplug), so a stale "grabbed"/"eaten" entry for a
     /// now-gone device can't linger.
-    pub fn forget_device(&mut self, fd: RawFd) {
+    pub fn forget_device(&mut self, fd: DeviceId) {
+        let keys: Vec<_> = self
+            .mirrored
+            .iter()
+            .filter_map(|(id, key)| (*id == fd).then_some(*key))
+            .collect();
+        for key in keys {
+            self.forward(fd, key, 0);
+        }
+        self.pending.remove(&fd);
         self.senders.remove(&fd);
         self.grabbed.remove(&fd);
         self.names.remove(&fd);
         self.eaten.remove(&fd);
     }
 
-    pub fn is_grabbed(&self, fd: RawFd) -> bool {
+    pub fn is_grabbed(&self, fd: DeviceId) -> bool {
         *self.grabbed.get(&fd).unwrap_or(&false)
     }
 
-    pub fn forward(&mut self, code: KeyCode, value: i32) {
+    pub fn forward(&mut self, fd: DeviceId, code: KeyCode, value: i32) {
+        if !update_mirrored(&mut self.mirrored, fd, code, value) {
+            return;
+        }
         self.mirror.forward(code, value);
     }
 
-    pub fn mark_eaten(&mut self, fd: RawFd, code: KeyCode) {
+    pub fn acknowledge(&mut self, fd: DeviceId, grabbed: bool) {
+        self.pending.remove(&fd);
+        if self.is_grabbed(fd) != grabbed {
+            ee_log!(
+                "capture: {} input device (reader {fd})",
+                if grabbed { "grabbed" } else { "released" }
+            );
+        }
+        self.grabbed.insert(fd, grabbed);
+    }
+
+    pub fn mark_eaten(&mut self, fd: DeviceId, code: KeyCode) {
         self.eaten.entry(fd).or_default().insert(code);
     }
 
-    pub fn is_eaten(&self, fd: RawFd, code: KeyCode) -> bool {
+    pub fn is_eaten(&self, fd: DeviceId, code: KeyCode) -> bool {
         self.eaten.get(&fd).is_some_and(|set| set.contains(&code))
     }
 
     /// Removes `code` from `fd`'s eaten set, if present, and reports
     /// whether it was — so the caller (a keyup) knows not to forward the
     /// release of a key whose press was consumed.
-    pub fn take_eaten(&mut self, fd: RawFd, code: KeyCode) -> bool {
+    pub fn take_eaten(&mut self, fd: DeviceId, code: KeyCode) -> bool {
         self.eaten.get_mut(&fd).is_some_and(|set| set.remove(&code))
     }
 
@@ -246,11 +295,11 @@ impl Capture {
     /// tidiness).
     pub async fn maybe_transition(
         &mut self,
-        fd: RawFd,
+        fd: DeviceId,
         want: bool,
-        held: &HashSet<(RawFd, KeyCode)>,
+        held: &HashSet<(DeviceId, KeyCode)>,
     ) {
-        if self.is_grabbed(fd) == want {
+        if self.is_grabbed(fd) == want || self.pending.contains(&fd) {
             return;
         }
         if held.iter().any(|(held_fd, _)| *held_fd == fd) {
@@ -275,11 +324,7 @@ impl Capture {
             );
             return;
         }
-        self.grabbed.insert(fd, want);
-        ee_log!(
-            "capture: {} input device (fd {fd})",
-            if want { "grabbed" } else { "released" }
-        );
+        self.pending.insert(fd);
     }
 
     /// `maybe_transition` for every device in `fds` — called on startup and
@@ -289,9 +334,9 @@ impl Capture {
     /// keystroke.
     pub async fn recheck_all(
         &mut self,
-        fds: &[RawFd],
+        fds: &[DeviceId],
         want: bool,
-        held: &HashSet<(RawFd, KeyCode)>,
+        held: &HashSet<(DeviceId, KeyCode)>,
     ) {
         for &fd in fds {
             self.maybe_transition(fd, want, held).await;
@@ -301,7 +346,45 @@ impl Capture {
 
 #[cfg(test)]
 mod tests {
-    use super::{hypr_device_name, MIRROR_KEYBOARD_NAME};
+    use super::{hypr_device_name, mirror_keys, update_mirrored, MIRROR_KEYBOARD_NAME};
+    use evdev::KeyCode;
+    use std::collections::HashSet;
+
+    #[test]
+    fn removed_keyboard_releases_only_its_last_mirrored_keys() {
+        let mut held = HashSet::new();
+        let ctrl = KeyCode::KEY_LEFTCTRL;
+        let alt = KeyCode::KEY_LEFTALT;
+        update_mirrored(&mut held, 1, ctrl, 1);
+        update_mirrored(&mut held, 2, ctrl, 1);
+        update_mirrored(&mut held, 1, alt, 1);
+        assert!(!update_mirrored(&mut held, 1, ctrl, 0));
+        assert!(update_mirrored(&mut held, 1, alt, 0));
+        assert!(held.contains(&(2, ctrl)));
+        assert!(update_mirrored(&mut held, 2, ctrl, 0));
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn mirror_covers_extended_keyboard_keys_without_pointer_buttons() {
+        let keys = mirror_keys();
+        for key in [
+            KeyCode::KEY_A,
+            KeyCode::KEY_LEFTCTRL,
+            KeyCode::KEY_F24,
+            KeyCode::KEY_VOLUMEUP,
+        ] {
+            assert!(keys.contains(key));
+        }
+        for key in [
+            KeyCode::KEY_RESERVED,
+            KeyCode::BTN_LEFT,
+            KeyCode::BTN_SOUTH,
+            KeyCode::BTN_DPAD_UP,
+        ] {
+            assert!(!keys.contains(key));
+        }
+    }
 
     #[test]
     fn matches_live_hyprland_device_names() {
