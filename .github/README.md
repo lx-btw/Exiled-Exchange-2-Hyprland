@@ -39,6 +39,10 @@ Download `ee2-hyprland-*.pkg.tar.zst` from this repository's
 sudo pacman -U ee2-hyprland-*.pkg.tar.zst
 ```
 
+This fork uses its own release versions, independent of upstream's versions.
+Tags use the `hyprland-v<version>` prefix to distinguish them from upstream's
+`v*` tags; syncing upstream does not automatically change the fork version.
+
 ### AppImage (x86_64)
 
 Download the `ee2-hyprland-appimage` artifact from a successful

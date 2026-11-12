@@ -10,7 +10,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="Hyprland-native price-check overlay for Path of Exile 2 (Exiled Exchange 2 fork)"
 arch=('x86_64')
-url="https://github.com/Kvan7/Exiled-Exchange-2"
+url="https://github.com/lx-btw/Exiled-Exchange-2-Hyprland"
 license=('MIT')
 
 # !debug, !lto: this machine's /etc/makepkg.conf has both `debug` and `lto`

@@ -48,9 +48,11 @@ glycin/bwrap, see the commented container security options in the workflow.
 Bump `pkgver` in `hyprland/packaging/PKGBUILD` and adjust `pkgrel` as needed.
 Commit the change, tag it `hyprland-v<pkgver>` and push the tag. CI checks that the
 tag matches `pkgver`, then publishes the Arch package, AppImage and checksum.
-The `hyprland-` prefix avoids collisions with upstream's `v*` tags. Verify the
-release assets and perform the in-game smoke test below; tag publication has not
-yet been exercised for the first fork release.
+The fork has its own version sequence, independent of upstream's version: the
+`hyprland-` tag prefix distinguishes fork releases from upstream's `v*` tags,
+including `v0.1.0`. Upstream updates do not automatically change the fork version;
+the release notes should identify the upstream version and commit used as the
+base. Verify the release assets and perform the in-game smoke test below.
 
 ## Updating upstream
 
