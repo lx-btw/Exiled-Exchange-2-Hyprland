@@ -5,9 +5,10 @@ including glibc, GTK4, WebKitGTK, Mesa and LLVM. This is separate from the nativ
 Arch package. No installer, device rules or autostart changes are included.
 Device permissions still apply; see [../README.md](../README.md).
 
-For an Xwayland game (`PROTON_ENABLE_WAYLAND=0`), install `xsel` on the host and
-launch with the game's `DISPLAY` in the environment. The image currently does
-not bundle `xsel`. Native Wayland games do not need it. Both Steam/Proton game
+For an Xwayland game (`PROTON_ENABLE_WAYLAND=0`), launch with the game's `DISPLAY`
+in the environment. The image bundles `xsel` and its libraries, and puts its
+wrapper first in `PATH`; no host `xsel` installation is needed. Native Wayland
+games do not use this helper. Both Steam/Proton game
 classes are recognized automatically; `EE2_GAME_CLASS` is only an exact override
 for other window classes.
 
@@ -19,11 +20,16 @@ while a pinned one stays over the game. Reply-to-whisper (`@last` prefix) also
 passed. Moving the game to other monitors and trailing forms such as
 `/invite @last` still need live checks.
 
+The image rebuilt with bundled `xsel` also passed consecutive price checks,
+stash search and chat commands. Its mounted main/WebKit GPU mappings passed;
+the extracted artifact's helper also ran with no system executable directories
+in `PATH`.
+
 ## Build
 
 Install the usual renderer/Rust build dependencies (`base-devel`, `nodejs`,
 `npm`, `rust`, `gtk4`, `gtk4-layer-shell`, `webkitgtk-6.0`) and the AppImage
-requirements: `mesa`, `llvm-libs`, `patchelf`, `bubblewrap`, `xdg-dbus-proxy`,
+requirements: `mesa`, `llvm-libs`, `xsel`, `patchelf`, `bubblewrap`, `xdg-dbus-proxy`,
 `curl` and `binutils`. The script checks required tools rather than installing
 anything. Downloads require network access; quick-sharun and its downloaded
 helpers are pinned with SHA-256 checksums.
@@ -40,7 +46,14 @@ An existing binary can be passed as the first argument, for example
 `bash hyprland/packaging/appimage/build-appimage.sh /usr/bin/ee2-hyprland`.
 Output is `out/ee2-hyprland-<pkgver>-x86_64.AppImage` and its `.sha256` file.
 Each build replaces this directory's scratch `build/` and the same-version
-output. It checks the dependency closure of every shipped dynamic ELF.
+output. It checks the dependency closure of every shipped dynamic ELF and runs
+the bundled `xsel --version` with no host executable directories in `PATH`.
+
+The fork CI builds the Arch package and AppImage from the same release binary
+and runtime libraries. Successful runs upload separate `ee2-hyprland-pkg` and
+`ee2-hyprland-appimage` artifacts. A `hyprland-v<pkgver>` tag publishes both formats and
+their checksums in one GitHub Release. CI validates the packaged dependencies
+and helper startup; it does not establish gameplay compatibility on other distros.
 
 ## Rendering
 
@@ -105,9 +118,58 @@ mounted startup, the runtime library check and these same overlay checks in game
    and hotkeys in other applications after switching focus.
 4. Re-run the runtime checker while the overlay is active and inspect stderr.
 
-Ubuntu 24.04+ AppArmor user-namespace restrictions are not handled yet. WebKit's
-sandbox remains enabled; a namespace failure needs investigation on that host.
-Debian, Fedora and NixOS checks, Ubuntu handling, `/tmp` path-mapping caveats and
-release/CI integration remain pending. The host accepts newer Hyprland monitor
-replies whose empty `specialWorkspace` has no `id`; rebuild the binary before
-packaging to include this compatibility fix.
+## Other distributions and troubleshooting
+
+This is an x86_64 **Hyprland-session** application, including when the game uses
+Xwayland. Ubuntu's default GNOME session or a plain X11 session does not provide
+the required Hyprland IPC, layer-shell and clipboard protocols. GTK, WebKitGTK,
+glibc, software Mesa, `bwrap`, `xdg-dbus-proxy` and `xsel` are bundled; access to
+`/dev/uinput` and physical `/dev/input/event*` devices still comes from the host
+session. See the device-access guide linked above if startup reports a permissions
+error. Run as the desktop user.
+
+Debian, Ubuntu, Fedora and NixOS gameplay is **not verified**. Community testing
+is needed; the checks above validate packaging on the build host.
+
+### FUSE and temporary paths
+
+If mounting fails, try the extraction-mode command above. Extraction is a
+[documented AppImage fallback](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
+and has been checked locally. It addresses FUSE mounting, not namespace policy
+or device permissions. An executable file location is required; an extracted
+image also needs sufficient writable temporary space.
+
+The pinned sharun tooling patches WebKit helper paths to a generated `/tmp`
+prefix and maps that prefix to the current AppDir. The host must permit this
+temporary path mapping; do not remove those paths while the app is running.
+Include any failing helper path in a report. Concurrent launches under separate
+users or sessions have not been verified.
+
+### Ubuntu AppArmor and restricted namespaces
+
+Ubuntu can restrict unprivileged user namespaces through AppArmor. WebKit's
+bubblewrap sandbox needs them; bundled libraries cannot grant host permission.
+Ubuntu documents [per-application permission through AppArmor profiles](https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/).
+After a failed launch, inspect stderr and these read-only diagnostics:
+
+```sh
+sysctl kernel.apparmor_restrict_unprivileged_userns
+journalctl -k -b --since "5 minutes ago" | grep 'apparmor="DENIED"'
+```
+
+A matching `userns_create` denial is useful evidence; the sysctl value alone
+does not prove that this application was denied. Kernel logs may require
+administrator access. The relocated bundled helper may not match a profile for
+`/usr/bin/bwrap`. An administrator needs to validate a narrowly scoped policy on
+that host; an untested profile is not shipped. WebKit's sandbox stays enabled,
+and the application does not change AppArmor or global namespace settings.
+Extraction mode does not resolve a namespace denial.
+
+### Reporting a compatibility problem
+
+Include the distro/version, architecture, Hyprland version, AppImage SHA-256,
+game mode (`PROTON_ENABLE_WAYLAND=0` or `1`), launch stderr and whether extraction
+mode behaves differently. For sandbox denials, include the matching AppArmor or
+SELinux audit record if available. Report which checks above pass: startup,
+price check, clicks, hide/show, stash search, chat and stash scrolling. If Python
+is available, also include the runtime checker's result for the active AppDir.

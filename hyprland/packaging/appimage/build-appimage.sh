@@ -16,7 +16,7 @@
 # Why quick-sharun and not a hand-rolled AppDir: it bundles glibc and the
 # dynamic loader (no "build on an old distro" requirement, works on musl
 # hosts), runs everything through sharun's `ld.so --library-path` instead of
-# LD_LIBRARY_PATH (nothing leaks into child processes such as xsel), and it
+# LD_LIBRARY_PATH (host children do not inherit bundled library paths), and it
 # has WebKitGTK-specific handling we'd otherwise have to reproduce — all
 # verified against the pinned quick-sharun.sh below:
 #   - any linked libwebkit*gtk-*.so pulls in its helper dir
@@ -31,7 +31,7 @@
 # Requirements (checked below, never installed): the binary's runtime deps
 # installed at their normal /usr locations (gtk4, gtk4-layer-shell,
 # webkitgtk-6.0 — quick-sharun copies them from the host, so build on Arch),
-# plus patchelf, bubblewrap, xdg-dbus-proxy and curl. zsync is NOT needed:
+# plus xsel, patchelf, bubblewrap, xdg-dbus-proxy and curl. zsync is NOT needed:
 # the pinned appimagetool has zsync generation built in and only does it when
 # update info (UPINFO) is set, which this script never sets.
 set -euo pipefail
@@ -86,14 +86,14 @@ outname=ee2-hyprland-$pkgver-$arch.AppImage
 # silently skips them otherwise — which would leave WebKit's sandbox to
 # whatever the user's host happens to have.
 required=(awk cp env find grep ldd mv patchelf rm sed sha256sum sleep strings
-  tar tr curl bwrap xdg-dbus-proxy readelf od paste)
+  tar tr curl bwrap xdg-dbus-proxy xsel readelf od paste)
 missing=()
 for tool in "${required[@]}"; do
   command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
 done
 if ((${#missing[@]})); then
   echo "error: missing required tools: ${missing[*]}" >&2
-  echo "(on Arch: patchelf, bubblewrap, xdg-dbus-proxy, curl, binutils for strings/readelf)" >&2
+  echo "(on Arch: xsel, patchelf, bubblewrap, xdg-dbus-proxy, curl, binutils for strings/readelf)" >&2
   exit 1
 fi
 
@@ -179,7 +179,8 @@ unset UPINFO GITHUB_REPOSITORY
 
 # --- build ------------------------------------------------------------------------
 cd "$build_dir"
-"$qs" "$bin"
+# Additional executable inputs use sharun wrappers and the same bundled loader.
+"$qs" "$bin" "$(command -v xsel)"
 
 # --- prune the AppDir -------------------------------------------------------------
 # quick-sharun deploys by generic rules; these are the parts that are
@@ -230,6 +231,8 @@ shopt -u nullglob
 # CROSS_LIBC_DLOPEN_ROOT), so this remains valid after mounting anywhere.
 # .env overrides caller settings, including a global GSK_RENDERER=ngl.
 cat >>"$APPDIR/.env" <<'EOF'
+# Child clipboard commands must prefer the bundled sharun wrapper.
+PATH=${SHARUN_DIR}/bin:${PATH}
 GSK_RENDERER=cairo
 GDK_DISABLE=gl,vulkan
 GDK_GL=disable
@@ -238,6 +241,18 @@ __EGL_VENDOR_LIBRARY_FILENAMES=${SHARUN_DIR}/share/glvnd/egl_vendor.d/50_mesa.js
 LIBGL_DRIVERS_PATH=${SHARUN_DIR}/lib/dri
 SHARUN_ALLOW_SYS_VKICD=0
 EOF
+
+# Check the wrapper and its payload separately; a host xsel must never mask a
+# missing helper. --version does not access either clipboard selection.
+if [[ ! -x $APPDIR/bin/xsel || ! -x $APPDIR/shared/bin/xsel ||
+      ! $APPDIR/bin/xsel -ef $APPDIR/sharun ]]; then
+  echo "error: bundled xsel payload or sharun wrapper is missing" >&2
+  exit 1
+fi
+if ! env PATH="$APPDIR/bin" "$APPDIR/bin/xsel" --version; then
+  echo "error: bundled xsel smoke check failed" >&2
+  exit 1
+fi
 
 # These dlopen inputs are invisible to the ELF closure check below.
 for file in lib/libEGL_mesa.so.0 lib/dri/swrast_dri.so \

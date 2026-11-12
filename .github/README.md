@@ -69,7 +69,8 @@ example rules: [`hyprland/packaging/README.md`](../hyprland/packaging/README.md)
 
 - Native Wayland (`PROTON_ENABLE_WAYLAND=1 %command%`) and Xwayland
   (`PROTON_ENABLE_WAYLAND=0 %command%`) game classes are recognized automatically.
-  Xwayland clipboard operations require `xsel` and a working `DISPLAY`.
+  Xwayland clipboard operations require a working `DISPLAY`. The AppImage
+  includes `xsel`; native-package users need the optional `xsel` dependency.
 - Optionally tie it to the game instead: `PROTON_ENABLE_WAYLAND=1 ee2-hyprland-wrap %command%`
   starts the service before the game and stops it when the game exits.
 - Logs: `journalctl --user -u ee2-hyprland -b`.
@@ -90,8 +91,9 @@ matter:
   itself is correct).
 - Hotkeys can use letters, digits, F-keys and common named keys; no numpad/media keys,
   and a bare modifier can't be a hotkey.
-- Xwayland clipboard operations require `xsel`; the AppImage currently uses the
-  host's copy rather than bundling it.
+- AppImage compatibility on Debian, Ubuntu, Fedora and NixOS needs community
+  testing. Host device permissions and sandbox policy still apply; see the
+  [AppImage guide](../hyprland/packaging/appimage/README.md).
 - A foreign layer-shell client taking the keyboard (e.g. rofi) while the overlay is
   interactive is not detected as focus loss.
 - No self-updater: updates come from installing a newer package.

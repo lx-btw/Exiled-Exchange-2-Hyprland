@@ -119,8 +119,8 @@ built here — it's kept only as a porting reference (`main/src/*.ts`).
 
 - `.github/workflows/hyprland-ci.yml` (Arch container): fork-boundary allowlist
   check, `fmt`, `clippy`, `cargo test` minus the two live-Wayland clipboard write
-  tests, `makepkg` artifact; a tag `v<pkgver>` additionally publishes a GitHub
-  Release with the package.
+  tests, `makepkg` and AppImage artifacts; a tag `hyprland-v<pkgver>` publishes
+  a GitHub Release with both formats and checksums.
 - `.github/workflows/hyprland-upstream-sync.yml` (daily): fast-forwards `master`
   from `upstream/master` (pushes via the deploy-key secret `SYNC_DEPLOY_KEY`),
   merges it into `upstream-sync` and opens/updates the PR into `hyprland`.

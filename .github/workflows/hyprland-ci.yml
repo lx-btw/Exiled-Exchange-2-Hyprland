@@ -1,12 +1,12 @@
 # Fork CI (hyprland branch only). Builds and checks the Rust host in an Arch
-# container — the distro the package targets — and uploads the pacman package.
-# A `v<pkgver>` tag additionally publishes it as a GitHub Release.
+# container — the distro the package targets — and uploads the pacman package
+# and AppImage. A `hyprland-v<pkgver>` tag publishes both as a GitHub Release.
 name: hyprland-ci
 
 on:
   push:
     branches: [hyprland, upstream-sync]
-    tags: ['v*']
+    tags: ['hyprland-v*']
     paths-ignore: ['**/*.md']   # not evaluated for tag pushes
   pull_request:
     branches: [hyprland]
@@ -44,7 +44,8 @@ jobs:
           pacman-key --init
           pacman-key --populate archlinux
           pacman -Sy --noconfirm archlinux-keyring
-          pacman -Su --noconfirm --needed git nodejs npm rust gtk4 gtk4-layer-shell webkitgtk-6.0
+          pacman -Su --noconfirm --needed git nodejs npm rust gtk4 gtk4-layer-shell webkitgtk-6.0 \
+            xsel patchelf bubblewrap xdg-dbus-proxy curl binutils python mesa llvm-libs
           rustc --version
           cargo clippy --version
           node --version
@@ -70,10 +71,10 @@ jobs:
           echo "OK: only fork files differ from $(git merge-base origin/master HEAD)"
 
       - name: Tag matches PKGBUILD pkgver
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/hyprland-v')
         run: |
           have=$(sed -n 's/^pkgver=//p' hyprland/packaging/PKGBUILD)
-          want=${GITHUB_REF_NAME#v}
+          want=${GITHUB_REF_NAME#hyprland-v}
           if [ "$have" != "$want" ]; then
             echo "::error::tag $GITHUB_REF_NAME but PKGBUILD pkgver=$have"
             exit 1
@@ -94,6 +95,9 @@ jobs:
       - name: cargo fmt
         working-directory: hyprland
         run: cargo fmt --check
+
+      - name: AppImage runtime checker tests
+        run: python hyprland/packaging/appimage/test-runtime.py
 
       # rust-embed needs the folder at compile time; debug builds read it from
       # disk at runtime, so an empty one is enough for clippy and tests.
@@ -126,6 +130,11 @@ jobs:
           runuser -u builder -- env HOME=/home/builder makepkg -f --noconfirm
           sha256sum ./*.pkg.tar.zst | tee SHA256SUMS
 
+      # Reuse makepkg's release binary and the same Arch runtime libraries.
+      # The builder checks the bundled ELF closure and software EGL payload.
+      - name: Build and check AppImage
+        run: bash hyprland/packaging/appimage/build-appimage.sh
+
       - uses: actions/upload-artifact@v7
         with:
           name: ee2-hyprland-pkg
@@ -136,9 +145,19 @@ jobs:
           retention-days: 7
           compression-level: 0   # already zstd
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ee2-hyprland-appimage
+          path: |
+            hyprland/packaging/appimage/out/*.AppImage
+            hyprland/packaging/appimage/out/*.AppImage.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0   # already compressed
+
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/hyprland-v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -146,11 +165,15 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: ee2-hyprland-pkg
-          path: dist
+          path: dist/pkg
+      - uses: actions/download-artifact@v8
+        with:
+          name: ee2-hyprland-appimage
+          path: dist/appimage
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "$GITHUB_REF_NAME" dist/*
+          gh release create "$GITHUB_REF_NAME" dist/pkg/* dist/appimage/*
           --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME"
           --generate-notes --verify-tag

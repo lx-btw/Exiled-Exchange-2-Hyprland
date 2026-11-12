@@ -2,7 +2,7 @@
 
 Build and run without a terminal, lifecycle tied to the game. CI builds the same
 package (`.github/workflows/hyprland-ci.yml`) and attaches it to a GitHub Release
-for `v<pkgver>` tags; the user-facing overview is `.github/README.md`.
+for `hyprland-v<pkgver>` tags; the user-facing overview is `.github/README.md`.
 
 ## Build
 
