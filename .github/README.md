@@ -33,7 +33,7 @@ The rationale for every design decision is in
 ### Prebuilt Arch package
 
 Download `ee2-hyprland-*.pkg.tar.zst` from this repository's
-[Releases](https://github.com/lx-btw/Exiled-Exchange-2/releases) (built by CI from version tags) and install it:
+[Releases](https://github.com/lx-btw/Exiled-Exchange-2-Hyprland/releases) (built by CI from version tags) and install it:
 
 ```sh
 sudo pacman -U ee2-hyprland-*.pkg.tar.zst
@@ -42,7 +42,7 @@ sudo pacman -U ee2-hyprland-*.pkg.tar.zst
 ### AppImage (x86_64)
 
 Download the `ee2-hyprland-appimage` artifact from a successful
-[hyprland-ci run](https://github.com/lx-btw/Exiled-Exchange-2/actions/workflows/hyprland-ci.yml)
+[hyprland-ci run](https://github.com/lx-btw/Exiled-Exchange-2-Hyprland/actions/workflows/hyprland-ci.yml)
 and extract the ZIP. Artifacts are retained for seven days. Fork releases tagged
 `hyprland-v<version>` also include the AppImage and its `.sha256` file.
 For version 0.1.0, run from the directory containing both files:
@@ -60,8 +60,8 @@ for FUSE extraction, Ubuntu AppArmor diagnostics and compatibility reports.
 ### From source
 
 ```sh
-git clone https://github.com/lx-btw/Exiled-Exchange-2.git
-cd Exiled-Exchange-2/hyprland/packaging
+git clone https://github.com/lx-btw/Exiled-Exchange-2-Hyprland.git
+cd Exiled-Exchange-2-Hyprland/hyprland/packaging
 makepkg -f
 sudo pacman -U ee2-hyprland-*.pkg.tar.zst
 ```
