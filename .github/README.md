@@ -67,8 +67,9 @@ example rules: [`hyprland/packaging/README.md`](../hyprland/packaging/README.md)
 
 ### Running
 
-- The game must run as a native Wayland client. Steam launch options:
-  `PROTON_ENABLE_WAYLAND=1 %command%`. Under Xwayland the overlay doesn't work.
+- Native Wayland (`PROTON_ENABLE_WAYLAND=1 %command%`) and Xwayland
+  (`PROTON_ENABLE_WAYLAND=0 %command%`) game classes are recognized automatically.
+  Xwayland clipboard operations require `xsel` and a working `DISPLAY`.
 - Optionally tie it to the game instead: `PROTON_ENABLE_WAYLAND=1 ee2-hyprland-wrap %command%`
   starts the service before the game and stops it when the game exits.
 - Logs: `journalctl --user -u ee2-hyprland -b`.
@@ -89,8 +90,8 @@ matter:
   itself is correct).
 - Hotkeys can use letters, digits, F-keys and common named keys; no numpad/media keys,
   and a bare modifier can't be a hotkey.
-- The game must run under native Wayland (`PROTON_ENABLE_WAYLAND=1`); under Xwayland
-  the overlay doesn't work.
+- Xwayland clipboard operations require `xsel`; the AppImage currently uses the
+  host's copy rather than bundling it.
 - A foreign layer-shell client taking the keyboard (e.g. rofi) while the overlay is
   interactive is not detected as focus loss.
 - No self-updater: updates come from installing a newer package.

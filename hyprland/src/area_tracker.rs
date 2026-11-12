@@ -261,7 +261,7 @@ async fn handle_wheel(delta: i32, modifiers: &ModifierState, overlay: &Weak<Toki
     let Some(game) = compositor::find_game(&clients) else {
         eprintln!(
             "ee2-hyprland: stash-scroll: game window ({}) not found, ignoring wheel",
-            compositor::game_class()
+            compositor::game_class_label()
         );
         return;
     };

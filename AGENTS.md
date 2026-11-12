@@ -141,7 +141,8 @@ built here — it's kept only as a porting reference (`main/src/*.ts`).
   `./target/release/ee2-hyprland` needs nothing extra; `curl` to it needs `--noproxy '*'`.
   `cargo test` works as-is.
 - `EE2_GAME_CLASS=<class>` points "the game" at another window for testing without
-  PoE2 (default `pathofexilesteam.exe`).
+  PoE2. Defaults recognize `pathofexilesteam.exe` (native Wayland) and
+  `steam_app_2694490` (Xwayland); the variable replaces both with one exact class.
 - Surface/rendering problems: `WAYLAND_DEBUG=1`; HYPRLAND-NOTES.md §9.
 
 ## Upstream protocol boundary

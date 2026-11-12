@@ -598,7 +598,7 @@ impl Overlay {
     /// A new window mapped: a fresh game window re-arms the once-per-window
     /// welcome banner (fires on its first focus, `set_game_active`).
     pub fn on_window_opened(&mut self, class: &str) {
-        if class == compositor::game_class() {
+        if compositor::is_game_class(class) {
             self.game_attached = false;
         }
     }
@@ -723,7 +723,7 @@ impl Overlay {
             ee_log!("game focus: ignoring empty class (overlay released keyboard)");
             return;
         }
-        let active = class == compositor::game_class();
+        let active = compositor::is_game_class(class);
         if active == self.game_active {
             return;
         }
@@ -895,7 +895,7 @@ impl Overlay {
         let Some(game) = compositor::find_game(&clients) else {
             eprintln!(
                 "ee2-hyprland: copy-item: game window ({}) not found",
-                compositor::game_class()
+                compositor::game_class_label()
             );
             state.check_in_flight = false;
             return;
@@ -1055,7 +1055,7 @@ impl Overlay {
             let Some(game) = compositor::find_game(&clients) else {
                 eprintln!(
                     "ee2-hyprland: stash-search: game window ({}) not found",
-                    compositor::game_class()
+                    compositor::game_class_label()
                 );
                 return None;
             };
@@ -1128,7 +1128,7 @@ impl Overlay {
             let Some(game) = compositor::find_game(&clients) else {
                 eprintln!(
                     "ee2-hyprland: paste-in-chat: game window ({}) not found",
-                    compositor::game_class()
+                    compositor::game_class_label()
                 );
                 return None;
             };

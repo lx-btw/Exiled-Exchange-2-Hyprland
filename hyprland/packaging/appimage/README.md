@@ -5,6 +5,20 @@ including glibc, GTK4, WebKitGTK, Mesa and LLVM. This is separate from the nativ
 Arch package. No installer, device rules or autostart changes are included.
 Device permissions still apply; see [../README.md](../README.md).
 
+For an Xwayland game (`PROTON_ENABLE_WAYLAND=0`), install `xsel` on the host and
+launch with the game's `DISPLAY` in the environment. The image currently does
+not bundle `xsel`. Native Wayland games do not need it. Both Steam/Proton game
+classes are recognized automatically; `EE2_GAME_CLASS` is only an exact override
+for other window classes.
+
+The rebuilt image was verified with an Xwayland game on November 12 without an
+override: Shift+Space, consecutive price checks of different items, clicks and
+auto-hide, stash-search, chat commands and stash scrolling passed. Switching
+focus to another monitor's window also passed: an unpinned price check closes,
+while a pinned one stays over the game. Reply-to-whisper (`@last` prefix) also
+passed. Moving the game to other monitors and trailing forms such as
+`/invite @last` still need live checks.
+
 ## Build
 
 Install the usual renderer/Rust build dependencies (`base-devel`, `nodejs`,
@@ -73,8 +87,8 @@ A local mounted-image check passed with the renderer sending `render-state`, bun
 Mesa/EGL/LLVM in the main process and no host GPU libraries in either checked
 process. The rebuilt software-rendering image also passed live game checks for
 price-check rendering, clicks, auto-hide, repeated opening and Shift+Space on
-November 12. Remaining gameplay coverage includes stash search, paste in chat
-and stash scrolling. For future builds, repeat these checks:
+November 12. Stash search, chat commands and stash scrolling also passed with
+an Xwayland game. For future builds, repeat these checks:
 
 The image includes two native workarounds confirmed in game on November 12:
 with GTK 4.24/WebKitGTK 2.54, initially transparent windows can fail to submit

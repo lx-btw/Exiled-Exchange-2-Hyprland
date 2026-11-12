@@ -34,16 +34,30 @@ use tokio::sync::mpsc;
 /// recovery short of killing the process.
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The window `class` Hyprland reports for Path of Exile 2:
-/// `pathofexilesteam.exe` under Steam+Proton (`PROTON_ENABLE_WAYLAND=1`,
-/// native Wayland client) — Proton's own `basename.exe`-style naming, *not*
-/// Steam's `steam_app_<id>` wrapper class (`steam_app_2694490` never
-/// matches; `find_game` then silently finds nothing and every price check
-/// fails with "game window not found"). `EE2_GAME_CLASS` overrides it for
-/// other installs/launch methods, or for testing against a stand-in window
-/// — same escape hatch the prior prototype's `host.mjs` had.
-pub fn game_class() -> String {
-    std::env::var("EE2_GAME_CLASS").unwrap_or_else(|_| "pathofexilesteam.exe".to_string())
+/// Default window classes Hyprland reports for Path of Exile 2 under Proton:
+/// Proton's executable class for native Wayland and Steam's app id class for
+/// Xwayland. `EE2_GAME_CLASS` replaces both defaults with one exact class,
+/// which also supports stand-in windows during testing.
+const GAME_CLASSES: [&str; 2] = ["pathofexilesteam.exe", "steam_app_2694490"];
+
+fn game_class_override() -> Option<String> {
+    std::env::var("EE2_GAME_CLASS").ok()
+}
+
+fn is_game_class_with_override(class: &str, override_class: Option<&str>) -> bool {
+    match override_class {
+        Some(override_class) => class == override_class,
+        None => GAME_CLASSES.contains(&class),
+    }
+}
+
+pub fn is_game_class(class: &str) -> bool {
+    let override_class = game_class_override();
+    is_game_class_with_override(class, override_class.as_deref())
+}
+
+pub fn game_class_label() -> String {
+    game_class_override().unwrap_or_else(|| GAME_CLASSES.join(" or "))
 }
 
 fn socket_dir() -> Option<PathBuf> {
@@ -194,10 +208,18 @@ pub async fn game_origin() -> io::Result<Option<(i32, i32)>> {
 }
 
 fn visible_game_origin(clients: &[Client], monitors: &[Monitor]) -> Option<(i32, i32)> {
-    let class = game_class();
+    let override_class = game_class_override();
+    visible_game_origin_with_override(clients, monitors, override_class.as_deref())
+}
+
+fn visible_game_origin_with_override(
+    clients: &[Client],
+    monitors: &[Monitor],
+    override_class: Option<&str>,
+) -> Option<(i32, i32)> {
     clients
         .iter()
-        .filter(|c| c.class == class && c.mapped && !c.hidden)
+        .filter(|c| is_game_class_with_override(&c.class, override_class) && c.mapped && !c.hidden)
         .find_map(|game| {
             let ws = game.workspace.id;
             let monitor = if ws < 0 {
@@ -274,11 +296,10 @@ pub async fn switchxkblayout(device: &str, index: i32) -> io::Result<()> {
 }
 
 /// Finds the game window among `clients` — `clients().await` filtered by
-/// `class == game_class()`, split out so callers that already have a client
+/// game-class predicate, split out so callers that already have a client
 /// list (e.g. from a fresher `clients()` call) don't need a second query.
 pub fn find_game(clients: &[Client]) -> Option<&Client> {
-    let class = game_class();
-    clients.iter().find(|c| c.class == class)
+    clients.iter().find(|c| is_game_class(&c.class))
 }
 
 /// What `watch_active_window` reports.
@@ -403,9 +424,13 @@ pub async fn watch_active_window(tx: mpsc::UnboundedSender<WatchEvent>) -> io::R
 mod tests {
     use super::*;
 
+    fn visible_game_origin(clients: &[Client], monitors: &[Monitor]) -> Option<(i32, i32)> {
+        visible_game_origin_with_override(clients, monitors, None)
+    }
+
     fn client(ws: i64, monitor: i32) -> Client {
         Client {
-            class: game_class(),
+            class: GAME_CLASSES[0].to_string(),
             title: String::new(),
             xwayland: false,
             at: (0, 0),
@@ -425,6 +450,48 @@ mod tests {
             active_workspace: WorkspaceRef { id: active },
             special_workspace: WorkspaceRef { id: special },
         }
+    }
+
+    #[test]
+    fn game_class_defaults_and_override_are_exact() {
+        assert!(is_game_class_with_override("pathofexilesteam.exe", None));
+        assert!(is_game_class_with_override("steam_app_2694490", None));
+        assert!(!is_game_class_with_override("steam_app_123", None));
+        assert!(!is_game_class_with_override("other-game.exe", None));
+        assert!(!is_game_class_with_override("", None));
+
+        assert!(is_game_class_with_override("stand-in", Some("stand-in")));
+        assert!(!is_game_class_with_override(
+            "pathofexilesteam.exe",
+            Some("stand-in")
+        ));
+        assert!(!is_game_class_with_override(
+            "steam_app_2694490",
+            Some("stand-in")
+        ));
+        assert!(!is_game_class_with_override(
+            "steam_app_2694490",
+            Some("pathofexilesteam.exe")
+        ));
+    }
+
+    #[test]
+    fn both_default_game_classes_resolve_the_visible_game_origin() {
+        let monitor = monitor(0, 0, 1, 0);
+        for class in GAME_CLASSES {
+            let mut game = client(1, 0);
+            game.class = class.to_string();
+            assert_eq!(
+                visible_game_origin_with_override(&[game], std::slice::from_ref(&monitor), None),
+                Some((0, 0))
+            );
+        }
+        let mut unrelated = client(1, 0);
+        unrelated.class = "steam_app_123".to_string();
+        assert_eq!(
+            visible_game_origin_with_override(&[unrelated], &[monitor], None),
+            None,
+        );
     }
 
     #[test]

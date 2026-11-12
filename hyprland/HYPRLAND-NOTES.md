@@ -366,9 +366,12 @@ decoding, so a multi-byte character (Cyrillic window titles) can't be cut at a r
 boundary. A literal `{}` reply to `j/activewindow` means "nothing focused"; any
 other parse failure is an error.
 
-The game window is found by class: `pathofexilesteam.exe` (Proton's naming under
-Steam with `PROTON_ENABLE_WAYLAND=1`, not Steam's `steam_app_2694490`), overridable
-with `EE2_GAME_CLASS`.
+The game window is found by class: `pathofexilesteam.exe` under native Wayland or
+`steam_app_2694490` under Xwayland. Both were observed with Steam/Proton. One shared
+predicate covers focus, attach, visibility and action-time window lookup.
+`EE2_GAME_CLASS` replaces both defaults with one exact class for other installs
+or stand-in windows. The former native-only class check was the confirmed cause
+of the Xwayland game not activating the overlay or its hotkeys.
 
 ## 8. Per-device XKB layout sync for captured keyboards
 
