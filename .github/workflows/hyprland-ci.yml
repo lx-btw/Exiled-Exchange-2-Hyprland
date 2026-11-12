@@ -62,7 +62,7 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           bad=$(git diff --name-only origin/master...HEAD \
-                | grep -vE '^(hyprland/|\.github/workflows/hyprland-[^/]+\.ya?ml$|\.github/README\.md$|AGENTS\.md$|PLAN\.md$)' || true)
+                | grep -vE '^(hyprland/|\.github/workflows/hyprland-[^/]+\.ya?ml$|\.github/README\.md$|AGENTS\.md$)' || true)
           if [ -n "$bad" ]; then
             echo "::error title=Fork boundary violated::files outside the fork area differ from master"
             echo "$bad"

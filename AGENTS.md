@@ -4,15 +4,16 @@ This file provides guidance to Codex when working with code in this repository.
 
 ## What this repository is
 
-A private fork of [Kvan7/Exiled-Exchange-2](https://github.com/Kvan7/Exiled-Exchange-2)
+A fork of [Kvan7/Exiled-Exchange-2](https://github.com/Kvan7/Exiled-Exchange-2)
 (a PoE2 price-check overlay, itself forked from Awakened PoE Trade). Upstream targets
 Windows/X11 via Electron. This fork adds a native Hyprland/Wayland platform layer in
 `hyprland/` that replaces Electron's `main/` entirely.
 
 The fork is feature-complete and live-verified; it is in **maintenance mode** (small
-bug fixes, pulling upstream updates, Stage 6b CI/README work). Status, known
-limitations and the maintenance procedures (pulling upstream, bug triage) are in
-`PLAN.md`. Design rationale for every module: `hyprland/HYPRLAND-NOTES.md`.
+bug fixes and pulling upstream updates). User setup and known limitations are in
+[the public README](.github/README.md); CI, releases, upstream updates and bug triage
+are in [`hyprland/MAINTENANCE.md`](hyprland/MAINTENANCE.md). Design rationale for
+every module: `hyprland/HYPRLAND-NOTES.md`.
 
 ## Fork boundary — absolute and load-bearing, read before touching anything
 
@@ -20,7 +21,7 @@ limitations and the maintenance procedures (pulling upstream, bug triage) are in
   them.** Not a one-line fix, not a config tweak. They must stay byte-for-byte
   mergeable with `upstream/master` at all times.
 - `hyprland/` is the only directory with fork code (plus the root `AGENTS.md`,
-  `PLAN.md`, `.github/README.md` and `.github/workflows/hyprland-*.yml` — new files
+  `.github/README.md` and `.github/workflows/hyprland-*.yml` — new files
   only; upstream's `.github/workflows/{main,pages,test}.yml` stay untouched and are
   disabled in the repo settings; the root `README.md` is upstream's). It talks to the
   unmodified `renderer/` over the same HTTP+WebSocket protocol upstream's Electron
@@ -124,12 +125,12 @@ built here — it's kept only as a porting reference (`main/src/*.ts`).
 - `.github/workflows/hyprland-upstream-sync.yml` (daily): fast-forwards `master`
   from `upstream/master` (pushes via the deploy-key secret `SYNC_DEPLOY_KEY`),
   merges it into `upstream-sync` and opens/updates the PR into `hyprland`.
-- Setup, release procedure and caveats: PLAN.md, "CI and upstream sync".
+- Setup, release procedure and caveats: `hyprland/MAINTENANCE.md`, "CI and repository setup".
 
 ## Runtime and debugging
 
 - Logs: `journalctl --user -u ee2-hyprland -b` (all lines prefixed `ee2-hyprland:`,
-  renderer console output included). PLAN.md's bug-triage section lists the lines
+  renderer console output included). `hyprland/MAINTENANCE.md` lists the triage lines
   that matter (`set_interactive(...)`, `game focus`, `surface:`, `capture:`,
   `copy-item:` …).
 - Single instance: a second launch only activates the already-running
@@ -153,4 +154,4 @@ carrying named JSON events (`MAIN->OVERLAY::focus-change`, `CLIENT->MAIN::save-c
 `OVERLAY->MAIN::render-state`, …). As long as `hyprland/` speaks this protocol,
 `renderer/` needs zero modification. When upstream changes `ipc/types.ts`, that diff
 is the list of what `server.rs`/`state.rs` must catch up on — check it first on every
-sync (procedure in PLAN.md).
+sync (procedure in `hyprland/MAINTENANCE.md`).

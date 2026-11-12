@@ -1,9 +1,10 @@
 # Hyprland platform layer — technical notes
 
 This document is the single source of truth for *why* the platform layer in this
-directory is built the way it is. `PLAN.md` (repo root) holds the current status,
-known limitations and maintenance procedures; this file explains *why each decision
-was made*, so a future session (or contributor) doesn't have to re-derive it or
+directory is built the way it is. The [public README](../.github/README.md) covers
+setup and known limitations; [MAINTENANCE.md](MAINTENANCE.md) covers maintenance
+procedures. This file explains *why each decision was made*, so a future session
+(or contributor) doesn't have to re-derive it or
 accidentally undo it.
 
 It mirrors the structure of `LP0101/Exiled-Exchange-2`'s `WAYLAND-NATIVE-NOTES.md`
@@ -117,9 +118,16 @@ keyd-style (`input/hotkeys.rs` + `input/grab.rs`), is `EVIOCGRAB` on real physic
 keyboard devices, scoped and guarded so it can't leak into the "redefines a combo
 globally" failure mode above:
 
-- **Only real hardware is ever grabbed** — never `inject.rs`'s injection device or
-  `grab.rs`'s own mirror device, both excluded by name (otherwise their output would
-  loop back into the matcher). The mouse is never grabbed.
+- **Only physical keyboards are ever grabbed.** Physical identity is checked via
+  sysfs ancestry under `/sys/devices`, excluding `/sys/devices/virtual`; USB bus
+  identity alone is insufficient because uinput devices can advertise USB IDs.
+  The injection and mirror devices are also excluded to prevent their output
+  looping back into the matcher. Mouse devices are read-only and never grabbed.
+- **Devices are rediscovered every second.** This also works when no eligible
+  device was present at startup. Reader IDs are stable for each attachment, so a
+  delayed close event from an unplugged node cannot remove its replacement. The
+  mirror advertises the supported keyboard key range up front, allowing newly
+  attached keyboards to use the same passthrough path.
 - **Grab is active only while the game is focused.** The instant focus leaves PoE2,
   the device stops being grabbed (subject to the next point) and every other
   application on the system gets its keys back completely normally — there is no
@@ -143,9 +151,9 @@ globally" failure mode above:
   physical device grabbed mid-`ru` would otherwise go silent (typed keys reach the
   mirror, which starts at its own independent default `us` state) or come back
   desynced from whatever the user toggled to while typing through the mirror.
-- **No timers.** `evdev::Device` ungrabs itself on `Drop`, and `EVIOCGRAB` is
-  fd-scoped kernel state already released by the kernel on any process exit,
-  `SIGKILL` included — a crash needs no cleanup code here at all.
+- `evdev::Device` ungrabs itself on `Drop`, and `EVIOCGRAB` is fd-scoped kernel
+  state already released by the kernel on any process exit, `SIGKILL` included —
+  a crash needs no cleanup code here at all.
 
 Matching follows upstream's `globalShortcut` semantics: **exact modifier-set
 equality** (`Ctrl + D` must not fire on `Ctrl + Alt + D`), and hotkeys only fire
@@ -223,6 +231,17 @@ own `zwlr_data_control_source_v1` on a second, dedicated connection and thread
 (`run_writer`, a single `poll` on the connection fd plus an `eventfd` for new jobs
 — no timer, no `wl-copy`). Every source carries a private marker MIME type so the
 read side skips our own writes.
+
+The read and write connections each reconnect after a data-control failure, with
+a two-second retry delay. Cached clipboard text is cleared when the read connection
+drops; pending writes are rejected when the writer is unavailable. Clipboard
+responses and queued-write lifetimes are bounded to three seconds. This recovers
+data-control loss (including a `Finished` event), not a compositor restart: the
+application's primary GTK Wayland connection would also need to be recreated, so
+restart the application after the compositor itself restarts. A source `Send`
+callback writes to a blocking pipe; if a receiving client never reads, that writer
+thread can remain blocked even though the caller returns after its three-second
+timeout.
 
 **`restoreClipboard` uses a fixed 120 ms wait** (upstream's `RESTORE_AFTER`), not
 an event. The obvious signal — the source's `Send` event, "someone read it" —

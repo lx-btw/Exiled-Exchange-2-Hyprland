@@ -16,9 +16,19 @@ The rebuilt image was verified with an Xwayland game on November 12 without an
 override: Shift+Space, consecutive price checks of different items, clicks and
 auto-hide, stash-search, chat commands and stash scrolling passed. Switching
 focus to another monitor's window also passed: an unpinned price check closes,
-while a pinned one stays over the game. Reply-to-whisper (`@last` prefix) also
-passed. Moving the game to other monitors and trailing forms such as
-`/invite @last` still need live checks.
+while a pinned one stays over the game. Reply-to-whisper (`@last` prefix) and the
+remaining chat commands also passed. Moving the game to a differently scaled
+portrait screen exposed a stale monitor-lookup bug; the native fix passed a
+round trip back to the primary monitor and restoration of borderless mode.
+The latest AppImage includes this fix. Full portrait placement is not verified:
+the upstream panel-width formula can exceed a narrow viewport, and the game
+itself changed window mode during the move.
+
+The current native build also rediscovers keyboard and mouse devices every second.
+On the latest AppImage, in-game acceptance passed for Ctrl+D, Shift+Space, and
+keyboard/mouse unplug/replug recovery. Its build dependency-closure check, mounted
+startup and main/WebKit runtime library checks passed locally.
+SHA256: `6edebef7ae054778bb79b6cd76262bbc3c5e26fe7c71e22878c0568443a84a06`.
 
 The image rebuilt with bundled `xsel` also passed consecutive price checks,
 stash search and chat commands. Its mounted main/WebKit GPU mappings passed;

@@ -95,7 +95,7 @@ jobs:
             grep -qF "$f"$'\t' <<< "$reg" || missing="$missing $f"
           done
           if [ -n "$missing" ] && [ "$ALLOW" != true ]; then
-            echo "::error title=Unregistered upstream workflows::$missing would start on the master push. Register and disable them (PLAN.md, CI and upstream sync), or dispatch this workflow with allow_unregistered_workflows=true."
+            echo "::error title=Unregistered upstream workflows::$missing would start on the master push. Register and disable them (hyprland/MAINTENANCE.md, CI and repository setup), or dispatch this workflow with allow_unregistered_workflows=true."
             exit 1
           fi
 
@@ -141,7 +141,7 @@ jobs:
           if ! git merge --no-ff --no-edit -m "Merge upstream master ${new:0:8} into hyprland" upstream/master; then
             files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
             git merge --abort
-            echo "::error title=Upstream merge conflict::upstream ${new:0:8} conflicts with hyprland in: $files- resolve locally (PLAN.md, Maintenance procedures (a))."
+            echo "::error title=Upstream merge conflict::upstream ${new:0:8} conflicts with hyprland in: $files- resolve locally (hyprland/MAINTENANCE.md, Updating upstream)."
             printf '### Merge conflict\n\nConflicting files: `%s`\n' "$files" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
@@ -159,7 +159,7 @@ jobs:
             echo
             echo "**Merge with \"Create a merge commit\" only**: squash/rebase breaks \"master is an ancestor of hyprland\"."
             echo
-            echo "## Checklist (PLAN.md, Maintenance procedures (a))"
+            echo "## Checklist (hyprland/MAINTENANCE.md, Updating upstream)"
             echo "- [ ] \`ipc/types.ts\` / \`KeyToCode.ts\` changes reviewed against \`server.rs\` / \`state.rs::handle_ws_event\`"
             echo "- [ ] ported \`main/src\` files and \`renderer/src/web/background/IPC.ts\` (Electron UA check) skimmed"
             echo "- [ ] hyprland-ci green on this branch"

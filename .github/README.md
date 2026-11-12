@@ -100,12 +100,16 @@ configuration carries over.
 
 ## Known limitations
 
-Full list in [`PLAN.md`](../PLAN.md#known-limitations). The ones most likely to
-matter:
+The main user-visible limitations are listed below. See the
+[maintenance guide](../hyprland/MAINTENANCE.md#diagnostic-caveats) for diagnostic caveats.
 
 - `price-check.builtinBrowser` is unsupported; trade links open in the system browser.
   Keep that setting off.
-- Input devices plugged in after startup are not picked up until the overlay restarts.
+- Input devices are rediscovered every second; keyboard and mouse unplug/replug
+  recovery has been checked in game.
+- Clipboard data-control connections retry after disconnects. If the compositor
+  itself restarts, the app's primary GTK Wayland connection still requires an
+  application restart.
 - Caps Lock / Num Lock LEDs don't update while the game is focused (the lock state
   itself is correct).
 - Hotkeys can use letters, digits, F-keys and common named keys; no numpad/media keys,
@@ -134,8 +138,8 @@ rest — layer-shell, wlr-data-control, evdev and uinput — is compositor-agnos
 
 ## Development
 
-Fork rules and orientation: [`AGENTS.md`](../AGENTS.md); status, limitations and
-maintenance procedures: [`PLAN.md`](../PLAN.md).
+Fork rules and orientation: [`AGENTS.md`](../AGENTS.md); CI, releases, upstream
+updates and bug triage: [`hyprland/MAINTENANCE.md`](../hyprland/MAINTENANCE.md).
 
 ```sh
 cd renderer && npm ci && npm run make-index-files && npm run build   # embedded at compile time
@@ -148,7 +152,7 @@ cargo test        # clipboard tests need a live Hyprland session and wl-paste
 
 Branches: `master` mirrors `upstream/master` exactly; `hyprland` (the default branch)
 carries all fork code and merges `master`. Fork code lives only in `hyprland/` (plus
-this README, `AGENTS.md`, `PLAN.md` and the `hyprland-*` workflows); upstream
+this README, `AGENTS.md` and the `hyprland-*` workflows); upstream
 directories are never patched. A daily workflow fast-forwards `master` and opens a
 pull request merging it into `hyprland`.
 
