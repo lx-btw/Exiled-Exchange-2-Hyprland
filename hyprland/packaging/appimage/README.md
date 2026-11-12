@@ -54,6 +54,8 @@ and runtime libraries. Successful runs upload separate `ee2-hyprland-pkg` and
 `ee2-hyprland-appimage` artifacts. A `hyprland-v<pkgver>` tag publishes both formats and
 their checksums in one GitHub Release. CI validates the packaged dependencies
 and helper startup; it does not establish gameplay compatibility on other distros.
+The first CI-produced image was also downloaded, SHA-256 checked and verified
+locally for WebKit startup, library mappings and in-game price checks.
 
 ## Rendering
 

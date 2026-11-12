@@ -3,8 +3,9 @@
 A Hyprland-native fork of [Kvan7/Exiled-Exchange-2](https://github.com/Kvan7/Exiled-Exchange-2),
 the Path of Exile 2 price-check overlay (itself a fork of
 [Awakened PoE Trade](https://github.com/SnosMe/awakened-poe-trade) by SnosMe). It
-targets **Hyprland only** (Wayland) — not Windows, macOS, X11 or other Wayland
-compositors — and is packaged for Arch Linux. For any other platform, use upstream.
+targets **Hyprland sessions only**, with native Arch packages and an x86_64
+AppImage. The game can use native Wayland or Xwayland. Other distributions need
+community testing; Windows, macOS and other desktop sessions are outside this fork.
 
 ## What's different from upstream
 
@@ -20,7 +21,7 @@ upstream's do.
 | Overlay window | `electron-overlay-window` (X11 attach) | GTK4 + gtk4-layer-shell surface hosting a WebKitGTK 6 WebView |
 | Hotkeys | Electron `globalShortcut` (`XGrabKey`) | evdev; keyboards are grabbed (`EVIOCGRAB`) only while the game is focused, unmatched keys re-emitted through a uinput mirror |
 | Key injection (item copy, chat, stash search) | `uiohook-napi` (XTEST) | uinput virtual keyboard |
-| Clipboard | Chromium's X11 clipboard | wlr-data-control, event-driven |
+| Clipboard | Chromium's X11 clipboard | wlr-data-control for Wayland; xsel for Xwayland |
 | Game window / monitor state | X11 | Hyprland IPC sockets (`.socket.sock`, `.socket2.sock`) |
 | Tray | Electron `Tray` | StatusNotifierItem via `ksni` |
 
@@ -29,7 +30,7 @@ The rationale for every design decision is in
 
 ## Install
 
-### Prebuilt package
+### Prebuilt Arch package
 
 Download `ee2-hyprland-*.pkg.tar.zst` from this repository's
 [Releases](https://github.com/lx-btw/Exiled-Exchange-2/releases) (built by CI from version tags) and install it:
@@ -37,6 +38,24 @@ Download `ee2-hyprland-*.pkg.tar.zst` from this repository's
 ```sh
 sudo pacman -U ee2-hyprland-*.pkg.tar.zst
 ```
+
+### AppImage (x86_64)
+
+Download the `ee2-hyprland-appimage` artifact from a successful
+[hyprland-ci run](https://github.com/lx-btw/Exiled-Exchange-2/actions/workflows/hyprland-ci.yml)
+and extract the ZIP. Artifacts are retained for seven days. Fork releases tagged
+`hyprland-v<version>` also include the AppImage and its `.sha256` file.
+For version 0.1.0, run from the directory containing both files:
+
+```sh
+sha256sum -c ee2-hyprland-0.1.0-x86_64.AppImage.sha256
+chmod +x ee2-hyprland-0.1.0-x86_64.AppImage
+./ee2-hyprland-0.1.0-x86_64.AppImage
+```
+
+GTK, WebKitGTK, software Mesa and the Xwayland clipboard helper are bundled.
+The device permissions below still apply. See the [AppImage guide](../hyprland/packaging/appimage/README.md)
+for FUSE extraction, Ubuntu AppArmor diagnostics and compatibility reports.
 
 ### From source
 
@@ -55,7 +74,7 @@ Runtime dependencies: `gtk4`, `gtk4-layer-shell`, `webkitgtk-6.0`.
 
 ### Device access
 
-The package installs no udev rules, so the user running the overlay needs:
+Neither format installs udev rules, so the user running the overlay needs:
 
 - `/dev/uinput` read+write — the virtual keyboard. Without it the app refuses to start.
 - `/dev/input/event*` read — hotkeys and hover tracking. Without it the overlay runs
