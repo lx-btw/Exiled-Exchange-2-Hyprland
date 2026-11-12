@@ -112,7 +112,7 @@ rest — layer-shell, wlr-data-control, evdev and uinput — is compositor-agnos
 
 ## Development
 
-Fork rules and orientation: [`CLAUDE.md`](../CLAUDE.md); status, limitations and
+Fork rules and orientation: [`AGENTS.md`](../AGENTS.md); status, limitations and
 maintenance procedures: [`PLAN.md`](../PLAN.md).
 
 ```sh
@@ -126,7 +126,7 @@ cargo test        # clipboard tests need a live Hyprland session and wl-paste
 
 Branches: `master` mirrors `upstream/master` exactly; `hyprland` (the default branch)
 carries all fork code and merges `master`. Fork code lives only in `hyprland/` (plus
-this README, `CLAUDE.md`, `PLAN.md` and the `hyprland-*` workflows); upstream
+this README, `AGENTS.md`, `PLAN.md` and the `hyprland-*` workflows); upstream
 directories are never patched. A daily workflow fast-forwards `master` and opens a
 pull request merging it into `hyprland`.
 

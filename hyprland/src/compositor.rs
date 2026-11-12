@@ -101,8 +101,26 @@ pub struct Monitor {
     pub y: i32,
     #[serde(rename = "activeWorkspace")]
     pub active_workspace: WorkspaceRef,
-    #[serde(rename = "specialWorkspace")]
+    #[serde(rename = "specialWorkspace", deserialize_with = "special_workspace")]
     pub special_workspace: WorkspaceRef,
+}
+
+// New Hyprland versions omit id only for an empty special workspace.
+fn special_workspace<'de, D>(deserializer: D) -> Result<WorkspaceRef, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct SpecialWorkspace {
+        id: Option<i64>,
+        name: Option<String>,
+    }
+    let workspace = SpecialWorkspace::deserialize(deserializer)?;
+    match (workspace.id, workspace.name.as_deref()) {
+        (Some(id), _) => Ok(WorkspaceRef { id }),
+        (None, Some("")) => Ok(WorkspaceRef { id: 0 }),
+        _ => Err(serde::de::Error::missing_field("id")),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,6 +425,49 @@ mod tests {
             active_workspace: WorkspaceRef { id: active },
             special_workspace: WorkspaceRef { id: special },
         }
+    }
+
+    #[test]
+    fn empty_special_workspace_accepts_old_and_new_monitor_replies() {
+        for special in [
+            serde_json::json!({"id": 0, "name": ""}),
+            serde_json::json!({"address": "", "type": "", "name": ""}),
+        ] {
+            let monitor: Monitor = serde_json::from_value(serde_json::json!({
+                "id": 0, "x": 0, "y": 155,
+                "activeWorkspace": {"id": 1, "name": "1"},
+                "specialWorkspace": special,
+            }))
+            .unwrap();
+            assert_eq!(monitor.special_workspace.id, 0);
+            assert_eq!(
+                visible_game_origin(&[client(1, 0)], &[monitor]),
+                Some((0, 155))
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_workspace_ids_remain_required_when_not_empty_special() {
+        for (active, special) in [
+            (
+                serde_json::json!({"name": "1"}),
+                serde_json::json!({"id": 0, "name": ""}),
+            ),
+            (
+                serde_json::json!({"id": 1}),
+                serde_json::json!({"name": "special:game"}),
+            ),
+            (serde_json::json!({"id": 1}), serde_json::json!({})),
+        ] {
+            assert!(serde_json::from_value::<Monitor>(serde_json::json!({
+                "id": 0, "x": 0, "y": 0,
+                "activeWorkspace": active,
+                "specialWorkspace": special,
+            }))
+            .is_err());
+        }
+        assert!(serde_json::from_str::<WorkspaceRef>(r#"{"name":"1"}"#).is_err());
     }
 
     #[test]

@@ -41,7 +41,7 @@ to whatever user runs `ee2-hyprland`:
 **Why no rule is shipped**: a package silently dropping a udev rule at
 install time is exactly the kind of unrequested, system-wide side effect
 this fork's own design principle for Hyprland's config argues against
-(CLAUDE.md's fork-boundary section: the app never edits or binds anything
+(AGENTS.md's fork-boundary section: the app never edits or binds anything
 in Hyprland's config, because a prototype's config binds broke the same key
 combos in other applications system-wide). The same reasoning extends to
 udev here: granting a process

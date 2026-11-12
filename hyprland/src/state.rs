@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
+use gtk4::prelude::WidgetExt;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as TokioMutex};
 
@@ -144,7 +145,7 @@ struct Surface {
 
 fn apply_surface(surface: Surface) {
     gtk4::glib::MainContext::default().invoke(move || {
-        INTERACTIVE.with(|i| i.set(surface.interactive));
+        let was_interactive = INTERACTIVE.with(|i| i.replace(surface.interactive));
         if !surface.interactive {
             POINTER_OVER_WIDGET.with(|p| p.set(false));
         }
@@ -155,6 +156,10 @@ fn apply_surface(surface: Surface) {
                     // silently ignored on a not-yet-mapped layer surface
                     // (the overlay then opens without taking input).
                     overlay::window::set_monitor_by_origin(window, surface.origin);
+                    if surface.interactive && !was_interactive && window.is_mapped() {
+                        // Expanding a mapped passthrough region was observed to leave pointer focus on the game.
+                        overlay::window::set_visible(window, false);
+                    }
                     overlay::window::set_visible(window, true);
                     overlay::window::set_input_region(window, !surface.interactive);
                 } else {

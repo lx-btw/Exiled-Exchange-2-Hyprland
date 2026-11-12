@@ -1,0 +1,4 @@
+# build-appimage.sh scratch (downloads, AppDir) and its output
+/build/
+/out/
+__pycache__/

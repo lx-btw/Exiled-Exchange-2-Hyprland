@@ -61,7 +61,10 @@ pub fn build(app: &gtk4::Application, webview: &WebView) -> gtk4::ApplicationWin
 
     if let Some(display) = gtk4::gdk::Display::default() {
         let provider = gtk4::CssProvider::new();
-        provider.load_from_data("window, window.background { background-color: transparent; }");
+        provider.load_from_data(
+            "window, window.background { background-color: transparent; }
+             window.ee2-bootstrap { background-color: rgba(0, 0, 0, 0.004); }",
+        );
         gtk4::style_context_add_provider_for_display(
             &display,
             &provider,
@@ -79,6 +82,34 @@ pub fn build(app: &gtk4::Application, webview: &WebView) -> gtk4::ApplicationWin
     window.set_namespace(Some("ee2-hyprland"));
 
     window.set_child(Some(webview));
+
+    // Work around the missing first buffer observed with GTK 4.24/WebKit 2.54.
+    window.add_css_class("ee2-bootstrap");
+    let awaiting_first_map = std::cell::Cell::new(true);
+    window.connect_map(move |window| {
+        if !awaiting_first_map.get() {
+            return;
+        }
+        let Some(clock) = window.frame_clock() else {
+            return;
+        };
+        awaiting_first_map.set(false);
+        let handler = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let handler_for_callback = handler.clone();
+        let weak_window = window.downgrade();
+        *handler.borrow_mut() = Some(clock.connect_after_paint(move |clock| {
+            if let Some(window) = weak_window.upgrade() {
+                // Startup presents and immediately hides the window before its first frame.
+                if !window.is_mapped() || !window.is_visible() {
+                    return;
+                }
+                window.remove_css_class("ee2-bootstrap");
+            }
+            if let Some(handler) = handler_for_callback.borrow_mut().take() {
+                clock.disconnect(handler);
+            }
+        }));
+    });
 
     // The surface doesn't exist until realize — apply the initial
     // passthrough input region and (keyboard-)None mode then, not now.

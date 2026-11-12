@@ -72,7 +72,7 @@ makedepends=(
 # /dev/input/event* (hotkeys.rs's evdev listener, read) get a udev rule
 # from this package — see README.md in this directory for the reasoning
 # (short version: a package silently dropping a udev rule is the same kind
-# of unrequested system-wide side effect CLAUDE.md's fork-boundary section
+# of unrequested system-wide side effect AGENTS.md's fork-boundary section
 # rules out for Hyprland's own config, and the same principle applies here).
 # If access is missing the binary says so at startup rather than failing
 # silently: hotkeys.rs logs "no keyboard-like /dev/input device found" if
@@ -86,7 +86,7 @@ _repo_root="$startdir/../.."
 prepare() {
   cd "$_repo_root/renderer"
   npm ci
-  # CLAUDE.md: "must run before build — generates data-driven assets".
+  # AGENTS.md: "must run before build — generates data-driven assets".
   npm run make-index-files
 }
 
@@ -111,7 +111,7 @@ package() {
     "$pkgdir/usr/share/applications/ee2-hyprland.desktop"
 
   # main/build/icons/ is upstream's own electron-builder icon set — reading
-  # one of its files here is not "patching main/" (CLAUDE.md's fork
+  # one of its files here is not "patching main/" (AGENTS.md's fork
   # boundary is about never *editing* main/renderer/ipc/dataParser, not
   # about never reading an asset out of them). Repo root LICENSE (MIT)
   # covers it same as everything else in the tree.

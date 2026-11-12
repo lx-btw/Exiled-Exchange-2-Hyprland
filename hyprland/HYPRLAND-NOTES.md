@@ -271,6 +271,13 @@ Specific to this fork:
   with it, `set_opaque_region` is never sent. A `UserStyleSheet` forcing
   `html`/`body` transparent is **not** used: it reproducibly broke
   `KeyboardMode::Exclusive` through an unconfirmed mechanism.
+- **First transparent frame after the October 2026 system update.** With GTK
+  4.24.1/WebKitGTK 2.54.2, a fully transparent root submitted no real Wayland
+  buffers, even though HTML and the WebSocket loaded. `window.rs` seeds the root
+  with alpha 0.004 until the first visible `after-paint`, then removes the class.
+  Waiting for a visible frame matters: startup immediately hides the window.
+  HTML, transparent areas and repeated hide/show passed in a standalone probe
+  and in game on November 12; the responsible system component is not isolated.
 - **Keyboard model: the keyboard is where the pointer is; a focused text field
   takes priority.** Input region and keyboard mode are independent. While the
   overlay is mouse-interactive, `KeyboardMode` is `Exclusive` iff a text field
@@ -290,6 +297,11 @@ Specific to this fork:
   both are silently ignored on a not-yet-mapped layer surface. `state.rs`'s
   `apply_surface` applies the whole desired state (visible, monitor, region,
   keyboard) idempotently on the GTK main thread for every cause.
+  With Hyprland 0.57.2, expanding an already mapped passthrough region committed
+  the correct region but produced no `wl_pointer.enter`; Ctrl+D was visible
+  without receiving clicks. On the passthrough-to-interactive transition only,
+  `apply_surface` now hides/shows a mapped window before applying its region.
+  Price-check clicks, auto-hide and Shift+Space passed in game on November 12.
 - **Visibility follows the game window, not the user.** A layer surface belongs to
   a monitor, not a workspace, so on its own it would follow the user to every other
   workspace. The surface is only mapped while the game window is on screen (its

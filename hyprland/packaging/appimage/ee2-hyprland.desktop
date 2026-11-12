@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Exiled Exchange 2 (Hyprland)
+Comment=Price-check overlay for Path of Exile 2, native Hyprland/Wayland build
+Exec=ee2-hyprland
+Icon=ee2-hyprland
+Terminal=false
+Categories=Game;Utility;
+Keywords=poe;poe2;price;trade;overlay;
+StartupNotify=false
+StartupWMClass=io.github.lx_btw.ee2_hyprland

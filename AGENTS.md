@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex when working with code in this repository.
 
 ## What this repository is
 
@@ -19,7 +19,7 @@ limitations and the maintenance procedures (pulling upstream, bug triage) are in
 - `main/`, `renderer/`, `ipc/`, `dataParser/`, `docs/` are upstream. **Never patch
   them.** Not a one-line fix, not a config tweak. They must stay byte-for-byte
   mergeable with `upstream/master` at all times.
-- `hyprland/` is the only directory with fork code (plus the root `CLAUDE.md`,
+- `hyprland/` is the only directory with fork code (plus the root `AGENTS.md`,
   `PLAN.md`, `.github/README.md` and `.github/workflows/hyprland-*.yml` — new files
   only; upstream's `.github/workflows/{main,pages,test}.yml` stay untouched and are
   disabled in the repo settings; the root `README.md` is upstream's). It talks to the
